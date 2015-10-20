@@ -30,12 +30,24 @@
 extern "C" {
 #endif
 
+struct _fdb_snap_doc {
+    void *meta;
+    void *body;
+};
+
 struct snap_wal_entry {
     void *key;
     fdb_seqnum_t seqnum;
     wal_item_action action;
+    uint8_t flag;
     uint16_t keylen;
-    uint64_t offset;
+    uint16_t metalen;
+    uint32_t bodylen;
+    union {
+        uint64_t offset; // snapshot taken from a persisted doc
+        struct _fdb_snap_doc *doc_body; // snapshot of a fully in-memory doc
+        uint64_t _body; // snapshot of fully in-mem doc with bodylen <=8, !meta
+    };
     struct avl_node avl;
     struct avl_node avl_seq;
 };
@@ -86,7 +98,7 @@ struct snap_handle {
 
 fdb_status snap_init(struct snap_handle *shandle, fdb_kvs_handle *handle);
 fdb_status snap_insert(struct snap_handle *shandle, fdb_doc *doc,
-                        uint64_t offset);
+                       uint64_t offset);
 fdb_status snap_find(struct snap_handle *shandle, fdb_doc *doc,
                       uint64_t *offset);
 fdb_status snap_remove(struct snap_handle *shandle, fdb_doc *doc);
@@ -94,6 +106,14 @@ fdb_status snap_clone(struct snap_handle *in, fdb_seqnum_t in_seq,
                       struct snap_handle **out, fdb_seqnum_t snap_seq);
 fdb_status snap_close(struct snap_handle *shandle);
 fdb_status snap_get_stat(struct snap_handle *shandle, struct kvs_stat *stat);
+
+INLINE void snap_free_cache_item(struct snap_wal_entry *item) {
+    if (!(item->flag & WAL_ITEM_OFF_IS_BODY)) {
+        free(item->doc_body->meta);
+        free(item->doc_body->body);
+        free(item->doc_body);
+    }
+}
 
 #ifdef __cplusplus
 }

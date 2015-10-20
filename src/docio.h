@@ -55,6 +55,8 @@ struct docio_handle {
         uint32_t bodylen_ondisk;
         uint8_t flag;
         uint8_t checksum;
+        uint8_t pad1; // reserved for future use
+        uint8_t pad2; // reserved for future use
     };
 #else
     // this structure will occupy 14 bytes

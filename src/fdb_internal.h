@@ -193,6 +193,7 @@ fdb_status fdb_kvs_rollback(fdb_kvs_handle **handle_ptr, fdb_seqnum_t seqnum);
  */
 stale_header_info fdb_get_smallest_active_header(fdb_kvs_handle *handle);
 
+// NOTE: If this changes, please change DOCIO_OVERHEAD_BYTES in filemgr.h
 INLINE size_t _fdb_get_docsize(struct docio_length len)
 {
     size_t ret =

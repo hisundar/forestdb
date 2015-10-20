@@ -36,11 +36,18 @@ enum{
     WAL_ACT_LOGICAL_REMOVE, // An item is marked as "DELETED" by removing its doc body only.
     WAL_ACT_REMOVE // An item (key, metadata, body) is removed immediately.
 };
-typedef int wal_insert_by;
-enum {
-    WAL_INS_WRITER = 0, // normal writer inserting
-    WAL_INS_COMPACT_PHASE1, // compactor in first phase moving unique docs
-    WAL_INS_COMPACT_PHASE2 // compactor in delta phase (catchup, uncommitted)
+
+#define WAL_INS_WRITER         0x01 // normal writer inserting
+#define WAL_INS_COMPACT_PHASE1 0x02 // compactor in first phase (unique docs)
+#define WAL_INS_COMPACT_PHASE2 0x04 // compactor in delta phase (catchup phase,
+                                    // ...moving uncommitted docs phase)
+#define WAL_INS_CACHE_FULL_DOC 0x08 // doc is not in disk, cache doc body too
+
+struct _fdb_doc {
+    uint16_t metalen;
+    uint32_t bodylen;
+    void *meta;
+    void *body;
 };
 
 struct wal_item_header{
@@ -55,12 +62,18 @@ struct wal_item_header{
 #define WAL_ITEM_FLUSH_READY (0x02)
 #define WAL_ITEM_BY_COMPACTOR (0x04)
 #define WAL_ITEM_MULTI_KV_INS_MODE (0x08)
+#define WAL_ITEM_HAS_FULL_DOC (0x10) // doc is not yet persisted (use *_fdb_doc)
+#define WAL_ITEM_OFF_IS_BODY (0x20) // no meta & bodylen < 8 (use _doc_body)
 struct wal_item{
     fdb_txn *txn;
     wal_item_action action;
     uint8_t flag;
     uint32_t doc_size;
-    uint64_t offset;
+    union {
+        uint64_t offset; // when document is persisted to disk
+        uint64_t _body; // when document body is <=8 bytes with no metadata
+        struct _fdb_doc *doc_body; // when caching whole doc with bodylen > 8
+    };
     uint64_t old_offset;
     fdb_seqnum_t seqnum;
     struct avl_node avl_seq;
@@ -82,9 +95,10 @@ typedef uint64_t wal_doc_move_func(void *dbhandle,
                                    void *new_dhandle,
                                    struct wal_item *item,
                                    fdb_doc *doc);
-typedef fdb_status wal_commit_mark_func(void *dbhandle,
-                                        uint64_t offset);
+typedef fdb_status wal_commit_mark_func(void *dbhandle, uint64_t offset);
 
+typedef bid_t wal_doc_persist_func(void *dhandle, void *doc, uint8_t deleted,
+                                   uint8_t txn_enabled);
 #define WAL_FLAG_INITIALIZED 0x1
 
 
@@ -135,13 +149,14 @@ fdb_status wal_insert(fdb_txn *txn,
                       struct filemgr *file,
                       fdb_doc *doc,
                       uint64_t offset,
-                      wal_insert_by caller);
+                      uint8_t ins_flag); // who is the caller? cache doc? etc
 fdb_status wal_immediate_remove(fdb_txn *txn,
                                 struct filemgr *file,
                                 fdb_doc *doc,
                                 uint64_t offset,
-                                wal_insert_by caller);
-fdb_status wal_find(fdb_txn *txn, struct filemgr *file, fdb_doc *doc, uint64_t *offset);
+                                uint8_t ins_flag);
+fdb_status wal_find(fdb_txn *txn, struct filemgr *file, fdb_doc *doc,
+                    uint64_t *offset);
 fdb_status wal_find_kv_id(fdb_txn *txn,
                           struct filemgr *file,
                           fdb_kvs_id_t kv_id,
@@ -153,7 +168,9 @@ fdb_status wal_txn_migration(void *dbhandle,
                              struct filemgr *old_file,
                              struct filemgr *new_file,
                              wal_doc_move_func *move_doc);
-fdb_status wal_commit(fdb_txn *txn, struct filemgr *file, wal_commit_mark_func *func,
+fdb_status wal_commit(fdb_txn *txn, struct filemgr *file,
+                      wal_doc_persist_func *write_func, void *write_handle,
+                      wal_commit_mark_func *func,
                       err_log_callback *log_callback);
 fdb_status wal_release_flushed_items(struct filemgr *file,
                                      union wal_flush_items *flush_items);

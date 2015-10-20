@@ -119,8 +119,67 @@ fdb_status snap_init(struct snap_handle *shandle, fdb_kvs_handle *handle)
     return FDB_RESULT_SUCCESS;
 }
 
+INLINE void _snap_cache_item(struct snap_wal_entry *item, fdb_doc *doc)
+
+{
+    item->metalen = doc->metalen;
+    item->bodylen = doc->bodylen;
+    if (!item->metalen && item->bodylen <= sizeof(item->_body)) {
+        memcpy(&item->_body, doc->body, doc->bodylen);
+        item->flag |= WAL_ITEM_OFF_IS_BODY;
+    } else {
+        item->flag &= ~WAL_ITEM_OFF_IS_BODY;
+        item->doc_body = (struct _fdb_snap_doc *)malloc(
+                sizeof(struct _fdb_snap_doc));
+        if (item->metalen) {
+            item->doc_body->meta = malloc(item->metalen);
+            memcpy(item->doc_body->meta, doc->meta, item->metalen);
+        } else {
+            item->doc_body->meta = NULL;
+        }
+        if (item->bodylen) {
+            item->doc_body->body = malloc(item->bodylen);
+            memcpy(item->doc_body->body, doc->body, item->bodylen);
+        } else {
+            item->doc_body->body = NULL;
+        }
+    }
+    item->flag |= WAL_ITEM_HAS_FULL_DOC;
+}
+
+INLINE void _snap_update_cache_item(struct snap_wal_entry *item, fdb_doc *doc)
+
+{
+    if (!(item->flag & WAL_ITEM_HAS_FULL_DOC) ||
+         item->flag & WAL_ITEM_OFF_IS_BODY) { // nothing to free
+        _snap_cache_item(item, doc);
+        return;
+    }
+    item->metalen = doc->metalen;
+    item->bodylen = doc->bodylen;
+    if (!item->metalen && item->bodylen <= sizeof(item->_body)) {
+        free(item->doc_body->meta);
+        free(item->doc_body->body);
+        free(item->doc_body);
+        memcpy(&item->_body, doc->body, doc->bodylen);
+        item->flag |= WAL_ITEM_OFF_IS_BODY;
+    } else {
+        item->doc_body = (struct _fdb_snap_doc *)malloc(
+                sizeof(struct _fdb_snap_doc));
+        if (item->metalen) {
+            item->doc_body->meta = realloc(item->doc_body->meta, item->metalen);
+            memcpy(item->doc_body->meta, doc->meta, item->metalen);
+        }
+        if (item->bodylen) {
+            item->doc_body->body = realloc(item->doc_body->body, item->bodylen);
+            memcpy(item->doc_body->body, doc->body, item->bodylen);
+        }
+    }
+    item->flag |= WAL_ITEM_HAS_FULL_DOC;
+}
+
 fdb_status snap_insert(struct snap_handle *shandle, fdb_doc *doc,
-                        uint64_t offset)
+                       uint64_t offset)
 {
     struct snap_wal_entry query;
     struct snap_wal_entry *item;
@@ -135,8 +194,9 @@ fdb_status snap_insert(struct snap_handle *shandle, fdb_doc *doc,
         item->keylen = doc->keylen;
         item->key = doc->key;
         item->seqnum = doc->seqnum;
+        item->flag = 0;
         if (doc->deleted) {
-            if (!offset) { // deleted item can never be at offset 0
+            if (!offset) { // logically deleted item can never be at offset 0
                 item->action = WAL_ACT_REMOVE; // must be a purged item
             } else {
                 item->action = WAL_ACT_LOGICAL_REMOVE;
@@ -144,7 +204,12 @@ fdb_status snap_insert(struct snap_handle *shandle, fdb_doc *doc,
         } else {
             item->action = WAL_ACT_INSERT;
         }
-        item->offset = offset;
+        if (item->action != WAL_ACT_REMOVE &&
+            offset == BLK_NOT_FOUND) { // Fully cached
+            _snap_cache_item(item, doc);
+        } else {
+            item->offset = offset;
+        }
         avl_insert(shandle->key_tree, &item->avl, _snp_wal_cmp);
         avl_insert(shandle->seq_tree, &item->avl_seq, _snp_seqnum_cmp);
 
@@ -175,14 +240,54 @@ fdb_status snap_insert(struct snap_handle *shandle, fdb_doc *doc,
         }
 
         item->action = doc->deleted ? WAL_ACT_LOGICAL_REMOVE : WAL_ACT_INSERT;
-        item->offset = offset;
+        if (offset == BLK_NOT_FOUND) { // fully cached in-memory doc
+            _snap_update_cache_item(item, doc);
+        } else { // cached item being replaced with a persisted item
+            if (item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                snap_free_cache_item(item);
+            }
+            item->offset = offset;
+        }
     }
 
     return FDB_RESULT_SUCCESS;
 }
 
+INLINE void _snap_copy_item(struct snap_wal_entry *item, fdb_doc *doc,
+                            bool copy_key) {
+    if (copy_key) {
+        doc->keylen = item->keylen;
+        if (!doc->key) {
+            doc->key = malloc(doc->keylen);
+        }
+        memcpy(doc->key, item->key, doc->keylen);
+    }
+    doc->metalen = item->metalen;
+    if (item->metalen) {
+        if (!doc->meta) {
+            doc->meta = malloc(item->metalen);
+        }
+        memcpy(doc->meta, item->doc_body->meta, item->metalen);
+    }
+    doc->bodylen = item->bodylen;
+    if (item->bodylen) {
+        if (!doc->body) {
+            doc->body = malloc(item->bodylen);
+        }
+        if (item->flag & WAL_ITEM_OFF_IS_BODY) {
+            memcpy(doc->body, &item->_body, item->bodylen);
+        } else {
+            memcpy(doc->body, &item->doc_body->body, item->bodylen);
+        }
+    }
+    doc->seqnum = item->seqnum;
+    doc->size_ondisk = item->keylen + item->metalen + item->bodylen
+                     + DOCIO_OVERHEAD_BYTES;
+    doc->offset = BLK_NOT_FOUND;
+}
+
 fdb_status snap_find(struct snap_handle *shandle, fdb_doc *doc,
-                      uint64_t *offset)
+                     uint64_t *offset)
 {
     struct snap_wal_entry query;
     struct avl_node *node;
@@ -200,7 +305,6 @@ fdb_status snap_find(struct snap_handle *shandle, fdb_doc *doc,
         } else {
             struct snap_wal_entry *item;
             item = _get_entry(node, struct snap_wal_entry, avl);
-            *offset = item->offset;
             if (item->action == WAL_ACT_INSERT) {
                 doc->deleted = false;
             } else {
@@ -208,6 +312,12 @@ fdb_status snap_find(struct snap_handle *shandle, fdb_doc *doc,
                 if (item->action == WAL_ACT_REMOVE) {
                     *offset = BLK_NOT_FOUND;
                 }
+            }
+            if (item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                _snap_copy_item(item, doc, false);
+                *offset = BLK_NOT_FOUND; // indicates that the doc was in-mem
+            } else {
+                *offset = item->offset;
             }
             return FDB_RESULT_SUCCESS;
         }
@@ -223,7 +333,6 @@ fdb_status snap_find(struct snap_handle *shandle, fdb_doc *doc,
         } else {
             struct snap_wal_entry *item;
             item = _get_entry(node, struct snap_wal_entry, avl_seq);
-            *offset = item->offset;
             if (item->action == WAL_ACT_INSERT) {
                 doc->deleted = false;
             } else {
@@ -231,6 +340,12 @@ fdb_status snap_find(struct snap_handle *shandle, fdb_doc *doc,
                 if (item->action == WAL_ACT_REMOVE) {
                     *offset = BLK_NOT_FOUND;
                 }
+            }
+            if (item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                _snap_copy_item(item, doc, true);
+                *offset = BLK_NOT_FOUND; // indicates that the doc was in-mem
+            } else {
+                *offset = item->offset;
             }
             return FDB_RESULT_SUCCESS;
         }
@@ -269,6 +384,9 @@ fdb_status snap_close(struct snap_handle *shandle)
                 a = avl_next(a);
                 avl_remove(shandle->key_tree, &snap_item->avl);
                 free(snap_item->key);
+                if (snap_item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                    snap_free_cache_item(snap_item);
+                }
                 free(snap_item);
             }
             free(shandle->key_tree);

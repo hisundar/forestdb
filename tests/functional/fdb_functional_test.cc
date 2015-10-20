@@ -97,7 +97,8 @@ void basic_test()
     }
 
     // remove document #5
-    fdb_doc_create(&rdoc, doc[5]->key, doc[5]->keylen, doc[5]->meta, doc[5]->metalen, NULL, 0);
+    fdb_doc_create(&rdoc, doc[5]->key, doc[5]->keylen, doc[5]->meta,
+                   doc[5]->metalen, NULL, 0);
     status = fdb_del(db, rdoc);
     TEST_CHK(status == FDB_RESULT_SUCCESS);
     fdb_doc_free(rdoc);
@@ -361,6 +362,7 @@ void config_test()
     TEST_CHK(status == FDB_RESULT_INVALID_CONFIG);
 
     fconfig = fdb_get_default_config();
+    fconfig.enable_deduplication = false;
     kvs_config = fdb_get_default_kvs_config();
     for (i = nfiles; i; --i) {
         sprintf(fname, "dummy%d", i);
@@ -717,7 +719,11 @@ void set_get_meta_test()
     status = fdb_get(db, rdoc);
     assert(status == FDB_RESULT_SUCCESS);
     status = fdb_get_byoffset(db, rdoc);
-    TEST_CHK(status == FDB_RESULT_SUCCESS);
+    if (!fconfig.enable_deduplication) {
+        TEST_CHK(status == FDB_RESULT_SUCCESS);
+    } else {
+        TEST_CHK(status == FDB_RESULT_INVALID_ARGS);
+    }
     status = fdb_get_metaonly(db, rdoc);
     assert(status == FDB_RESULT_SUCCESS);
     status = fdb_get_metaonly_byseq(db, rdoc);
@@ -737,9 +743,12 @@ void set_get_meta_test()
     assert(rdoc->deleted == true);
 
     status = fdb_get_byoffset(db, rdoc);
-    TEST_CHK(status == FDB_RESULT_KEY_NOT_FOUND);
+    if (!fconfig.enable_deduplication) {
+        TEST_CHK(status == FDB_RESULT_KEY_NOT_FOUND);
+    } else {
+        TEST_CHK(status == FDB_RESULT_INVALID_ARGS);
+    }
     assert(rdoc->deleted == true);
-
 
     fdb_doc_free(rdoc);
     fdb_kvs_close(db);

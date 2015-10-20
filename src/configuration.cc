@@ -90,6 +90,7 @@ fdb_config get_default_config(void) {
     fconfig.encryption_key.algorithm = FDB_ENCRYPTION_NONE;
     memset(fconfig.encryption_key.bytes, 0, sizeof(fconfig.encryption_key.bytes));
 
+    fconfig.enable_deduplication = false; // Will change on final patchset!!
     return fconfig;
 }
 

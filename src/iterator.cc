@@ -417,11 +417,41 @@ fdb_status fdb_iterator_init(fdb_kvs_handle *handle,
                     }
                     // copy from 'wal_item_header'
                     snap_item = (struct snap_wal_entry*)malloc(sizeof(struct snap_wal_entry));
-                    snap_item->keylen = wal_item_header->keylen;
+                    snap_item->keylen = (uint16_t)wal_item_header->keylen;
                     snap_item->key = (void*)malloc(snap_item->keylen);
                     memcpy(snap_item->key, wal_item_header->key, snap_item->keylen);
+                    snap_item->seqnum = wal_item->seqnum;
                     snap_item->action = wal_item->action;
-                    snap_item->offset = wal_item->offset;
+                    snap_item->flag = 0;
+                    if (wal_item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                        if (wal_item->flag & WAL_ITEM_OFF_IS_BODY) {
+                            snap_item->bodylen = wal_item->doc_size
+                                - DOCIO_OVERHEAD_BYTES - snap_item->keylen;
+                            snap_item->metalen = 0;
+                            snap_item->_body = wal_item->_body;
+                            snap_item->flag |= WAL_ITEM_OFF_IS_BODY;
+                        } else {
+                            snap_item->flag &= ~WAL_ITEM_OFF_IS_BODY;
+                            snap_item->doc_body = (struct _fdb_snap_doc *)
+                                          malloc(sizeof(struct _fdb_snap_doc));
+                            snap_item->metalen = wal_item->doc_body->metalen;
+                            snap_item->bodylen = wal_item->doc_body->bodylen;
+                            snap_item->doc_body->meta = malloc(
+                                                        snap_item->metalen);
+                            memcpy(snap_item->doc_body->meta,
+                                   wal_item->doc_body->meta,
+                                   snap_item->metalen);
+                            snap_item->doc_body->body = malloc(
+                                                        snap_item->bodylen);
+                            memcpy(snap_item->doc_body->body,
+                                   wal_item->doc_body->body,
+                                   snap_item->bodylen);
+
+                        }
+                        snap_item->flag |= WAL_ITEM_HAS_FULL_DOC;
+                    } else {
+                        snap_item->offset = wal_item->offset;
+                    }
 
                     // insert into tree
                     avl_insert(iterator->wal_tree, &snap_item->avl, _fdb_wal_cmp);
@@ -629,6 +659,36 @@ fdb_status fdb_iterator_sequence_init(fdb_kvs_handle *handle,
                         snap_item->seqnum = wal_item->seqnum;
                         snap_item->action = wal_item->action;
                         snap_item->offset = wal_item->offset;
+                        snap_item->flag = 0;
+
+                        if (wal_item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                            if (wal_item->flag & WAL_ITEM_OFF_IS_BODY) {
+                                snap_item->bodylen = wal_item->doc_size
+                                    - DOCIO_OVERHEAD_BYTES - snap_item->keylen;
+                                snap_item->metalen = 0;
+                                snap_item->_body = wal_item->_body;
+                                snap_item->flag |= WAL_ITEM_OFF_IS_BODY;
+                            } else {
+                                snap_item->flag &= ~WAL_ITEM_OFF_IS_BODY;
+                                snap_item->doc_body = (struct _fdb_snap_doc *)
+                                    malloc(sizeof(struct _fdb_snap_doc));
+                                snap_item->metalen = wal_item->doc_body->metalen;
+                                snap_item->bodylen = wal_item->doc_body->bodylen;
+                                snap_item->doc_body->meta = malloc(
+                                        snap_item->metalen);
+                                memcpy(snap_item->doc_body->meta,
+                                        wal_item->doc_body->meta,
+                                        snap_item->metalen);
+                                snap_item->doc_body->body = malloc(
+                                        snap_item->bodylen);
+                                memcpy(snap_item->doc_body->body,
+                                        wal_item->doc_body->body,
+                                        snap_item->bodylen);
+                            }
+                            snap_item->flag |= WAL_ITEM_HAS_FULL_DOC;
+                        } else {
+                            snap_item->offset = wal_item->offset;
+                        }
 
                         // insert into tree
                         avl_insert(iterator->wal_tree, &snap_item->avl_seq,
@@ -778,7 +838,7 @@ start:
             key = snap_item->key;
             keylen = snap_item->keylen;
             // key[hb-trie] is stashed in iterator->_key for future call
-            offset = snap_item->offset;
+            offset = (uint64_t)snap_item; // store address for snapshot_item
             iterator->status = FDB_ITR_WAL;
         }
         break;
@@ -931,7 +991,7 @@ start:
             key = snap_item->key;
             keylen = snap_item->keylen;
             // key[hb-trie] is stashed in iterator->key for next call
-            offset = snap_item->offset;
+            offset = (uint64_t)snap_item; // store address if AVL tree item
             iterator->status = FDB_ITR_WAL;
         }
         break;
@@ -1417,7 +1477,7 @@ fetch_hbtrie:
                 // key[HB+trie] will be returned next time
                 iterator->_offset = iterator->_get_offset;
             }
-            iterator->_get_offset = snap_item->offset;
+            iterator->_get_offset = (uint64_t)snap_item; // address if AVL item
             iterator->_dhandle = iterator->handle->dhandle;
             // move to next WAL entry
             iterator->tree_cursor = avl_next(iterator->tree_cursor);
@@ -1707,7 +1767,7 @@ start_seq:
             continue;
         }
 
-        offset = snap_item->offset;
+        offset = (uint64_t)snap_item;
         iterator->_offset = offset; // WAL is not exhausted, ignore B-Tree
         iterator->_seqnum = snap_item->seqnum;
         iterator->status = FDB_ITR_WAL;
@@ -1900,7 +1960,7 @@ start_seq:
                     return FDB_RESULT_ITERATOR_FAIL;
                 }
 
-                offset = snap_item->offset;
+                offset = (uint64_t)snap_item;
                 iterator->_offset = offset; // stops b-tree lookups. favor wal
                 iterator->_seqnum = snap_item->seqnum;
                 iterator->status = FDB_ITR_WAL;
@@ -2083,6 +2143,7 @@ fdb_status fdb_iterator_get(fdb_iterator *iterator, fdb_doc **doc)
     struct docio_handle *dhandle;
     size_t size_chunk = iterator->handle->config.chunksize;
     bool alloced_key, alloced_meta, alloced_body;
+    struct snap_wal_entry *snap_item;
 
     if (!iterator || !doc) {
         return FDB_RESULT_INVALID_ARGS;
@@ -2096,8 +2157,6 @@ fdb_status fdb_iterator_get(fdb_iterator *iterator, fdb_doc **doc)
     if (!atomic_cas_uint8_t(&iterator->handle->handle_busy, 0, 1)) {
         return FDB_RESULT_HANDLE_BUSY;
     }
-
-    offset = iterator->_get_offset;
 
     if (*doc == NULL) {
         ret = fdb_doc_create(doc, NULL, 0, NULL, 0, NULL, 0);
@@ -2119,6 +2178,55 @@ fdb_status fdb_iterator_get(fdb_iterator *iterator, fdb_doc **doc)
         alloced_key = _doc.key ? false : true;
         alloced_meta = _doc.meta ? false : true;
         alloced_body = _doc.body ? false : true;
+    }
+
+    if (iterator->status == FDB_ITR_WAL) {
+        snap_item = (struct snap_wal_entry *)iterator->_get_offset;
+        if (snap_item->flag & WAL_ITEM_HAS_FULL_DOC) {
+            (*doc)->metalen = snap_item->metalen;
+            (*doc)->bodylen = snap_item->bodylen;
+            (*doc)->seqnum = snap_item->seqnum;
+            (*doc)->deleted = (snap_item->action == WAL_ACT_LOGICAL_REMOVE) ?
+                              true : false;
+            (*doc)->offset = BLK_NOT_FOUND;
+            if (alloced_key) {
+                (*doc)->key = malloc(snap_item->keylen);
+            }
+            if (iterator->handle->kvs) {
+                memcpy((*doc)->key, (uint8_t*)snap_item->key + size_chunk,
+                       snap_item->keylen - size_chunk);
+                (*doc)->keylen = snap_item->keylen - size_chunk;
+            } else {
+                memcpy((*doc)->key, snap_item->key, snap_item->keylen);
+                (*doc)->keylen = snap_item->keylen;
+            }
+            if (snap_item->bodylen) {
+                if (alloced_body) {
+                    (*doc)->body = malloc(snap_item->bodylen);
+                }
+            }
+            if (!(snap_item->flag & WAL_ITEM_OFF_IS_BODY)) {
+                if (snap_item->metalen) {
+                    if (alloced_meta) {
+                        (*doc)->meta = malloc(snap_item->metalen);
+                    }
+                    memcpy((*doc)->meta, snap_item->doc_body->meta,
+                           snap_item->metalen);
+                }
+                memcpy((*doc)->body, snap_item->doc_body->body,
+                        snap_item->bodylen);
+            } else {
+                memcpy((*doc)->body, &snap_item->_body,
+                        snap_item->bodylen);
+            }
+            atomic_cas_uint8_t(&iterator->handle->handle_busy, 1, 0);
+            atomic_incr_uint64_t(&iterator->handle->op_stats->num_iterator_gets);
+            return FDB_RESULT_SUCCESS;
+        } else { // end of fully in-memory cached document processing
+            offset = snap_item->offset;
+        }
+    } else {
+        offset = iterator->_get_offset;
     }
 
     uint64_t _offset = docio_read_doc(dhandle, offset, &_doc, true);
@@ -2178,6 +2286,7 @@ fdb_status fdb_iterator_get_metaonly(fdb_iterator *iterator, fdb_doc **doc)
     struct docio_handle *dhandle;
     size_t size_chunk = iterator->handle->config.chunksize;
     bool alloced_key, alloced_meta;
+    struct snap_wal_entry *snap_item;
 
     if (!iterator || !doc) {
         return FDB_RESULT_INVALID_ARGS;
@@ -2191,8 +2300,6 @@ fdb_status fdb_iterator_get_metaonly(fdb_iterator *iterator, fdb_doc **doc)
     if (!atomic_cas_uint8_t(&iterator->handle->handle_busy, 0, 1)) {
         return FDB_RESULT_HANDLE_BUSY;
     }
-
-    offset = iterator->_get_offset;
 
     if (*doc == NULL) {
         ret = fdb_doc_create(doc, NULL, 0, NULL, 0, NULL, 0);
@@ -2212,6 +2319,45 @@ fdb_status fdb_iterator_get_metaonly(fdb_iterator *iterator, fdb_doc **doc)
         _doc.body = NULL;
         alloced_key = _doc.key ? false : true;
         alloced_meta = _doc.meta ? false : true;
+    }
+
+    if (iterator->status == FDB_ITR_WAL) {
+        snap_item = (struct snap_wal_entry *)iterator->_get_offset;
+        if (snap_item->flag & WAL_ITEM_HAS_FULL_DOC) {
+            (*doc)->metalen = snap_item->metalen;
+            (*doc)->bodylen = snap_item->bodylen;
+            (*doc)->seqnum = snap_item->seqnum;
+            (*doc)->deleted = (snap_item->action == WAL_ACT_LOGICAL_REMOVE) ?
+                              true : false;
+            (*doc)->offset = BLK_NOT_FOUND;
+            if (alloced_key) {
+                (*doc)->key = malloc(snap_item->keylen);
+            }
+            if (iterator->handle->kvs) {
+                memcpy((*doc)->key, (uint8_t*)snap_item->key + size_chunk,
+                       snap_item->keylen - size_chunk);
+                (*doc)->keylen = snap_item->keylen - size_chunk;
+            } else {
+                memcpy((*doc)->key, snap_item->key, snap_item->keylen);
+                (*doc)->keylen = snap_item->keylen;
+            }
+            if (!(snap_item->flag & WAL_ITEM_OFF_IS_BODY)) {
+                if (snap_item->metalen) {
+                    if (alloced_meta) {
+                        (*doc)->meta = malloc(snap_item->metalen);
+                    }
+                    memcpy((*doc)->meta, snap_item->doc_body->meta,
+                           snap_item->metalen);
+                }
+            }
+            atomic_cas_uint8_t(&iterator->handle->handle_busy, 1, 0);
+            atomic_incr_uint64_t(&iterator->handle->op_stats->num_iterator_gets);
+            return FDB_RESULT_SUCCESS;
+        }  else { // end of fully in-memory cached document processing
+            offset = snap_item->offset;
+        }
+    } else {
+        offset = iterator->_get_offset;
     }
 
     _offset = docio_read_doc_key_meta(dhandle, offset, &_doc, true);
@@ -2270,7 +2416,9 @@ fdb_status fdb_iterator_close(fdb_iterator *iterator)
                 snap_item = _get_entry(a, struct snap_wal_entry, avl);
                 a = avl_next(a);
                 avl_remove(iterator->wal_tree, &snap_item->avl);
-
+                if (snap_item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                    snap_free_cache_item(snap_item);
+                }
                 free(snap_item->key);
                 free(snap_item);
             }

@@ -461,6 +461,12 @@ typedef struct {
      * must be given, otherwise fdb_open will fail with error FDB_RESULT_NO_DB_HEADERS.
      */
     fdb_encryption_key encryption_key;
+    /**
+     * Enable De-duplication for the database. Set to TRUE by default.
+     * Writes will be cached in memory and frequent updates to same document will
+     * be deduplicated. Documents will not be written until commit or wal_flush
+     */
+    bool enable_deduplication;
 
 } fdb_config;
 

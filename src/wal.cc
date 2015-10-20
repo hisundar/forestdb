@@ -125,11 +125,168 @@ int wal_is_initialized(struct filemgr *file)
     return file->wal->flag & WAL_FLAG_INITIALIZED;
 }
 
+INLINE fdb_status _wal_cache_doc_item(wal_item *item, fdb_doc *doc) {
+    if (doc->bodylen <= sizeof(item->_body) && !doc->metalen) {
+        memcpy(&item->_body, doc->body, doc->bodylen);
+        item->flag |= WAL_ITEM_OFF_IS_BODY;
+    } else { // body larger than 8 bytes.. need to alloc memory
+        item->flag &= ~WAL_ITEM_OFF_IS_BODY;
+        item->doc_body = (struct _fdb_doc *)calloc(1,
+                         sizeof(struct _fdb_doc));
+        if (!item->doc_body) { // LCOV_EXCL_START
+            return FDB_RESULT_ALLOC_FAIL;
+        } // LCOV_EXCL_STOP
+        if (doc->metalen) { // metadata is present
+            item->doc_body->metalen = doc->metalen;
+            item->doc_body->meta = malloc(doc->metalen);
+            if (!item->doc_body->meta) { // LCOV_EXCL_START
+                free(item->doc_body);
+                item->doc_body = NULL;
+                item->flag &= ~WAL_ITEM_HAS_FULL_DOC;
+                return FDB_RESULT_ALLOC_FAIL;
+            } // LCOV_EXCL_STOP
+            memcpy(item->doc_body->meta, doc->meta, doc->metalen);
+        }
+        if (doc->bodylen) { // non-zero bodylen.. need to alloc
+            item->doc_body->bodylen = doc->bodylen;
+            item->doc_body->body = malloc(doc->bodylen);
+            if (!item->doc_body->body) { // LCOV_EXCL_START
+                free(item->doc_body->meta);
+                free(item->doc_body);
+                item->doc_body = NULL;
+                item->flag &= ~WAL_ITEM_HAS_FULL_DOC;
+                return FDB_RESULT_ALLOC_FAIL;
+            } // LCOV_EXCL_STOP
+            memcpy(item->doc_body->body, doc->body,
+                    doc->bodylen);
+        }
+    }
+    item->flag |= WAL_ITEM_HAS_FULL_DOC;
+    return FDB_RESULT_SUCCESS;
+}
+
+INLINE fdb_status _wal_update_cached_doc_item(wal_item *item, fdb_doc *doc) {
+    if (!(item->flag & WAL_ITEM_HAS_FULL_DOC) ||
+        item->flag & WAL_ITEM_OFF_IS_BODY) {
+        return _wal_cache_doc_item(item, doc);
+    } // else cached doc has bodylen > 8 and is allocated in doc_body...
+
+    if (doc->bodylen <= sizeof(item->_body) && !doc->metalen) {
+        free(item->doc_body->meta);
+        free(item->doc_body->body);
+        free(item->doc_body);
+        memcpy(&item->_body, doc->body, doc->bodylen);
+        item->flag |= WAL_ITEM_OFF_IS_BODY;
+    } else { // doc cannot be fitted into _body
+        item->flag &= ~WAL_ITEM_OFF_IS_BODY;
+        if (doc->metalen) {
+            item->doc_body->meta = realloc(item->doc_body->meta,
+                                           doc->metalen);
+            if (!item->doc_body->meta) { // LCOV_EXCL_START
+                free(item->doc_body);
+                item->flag &= ~WAL_ITEM_OFF_IS_BODY;
+                item->flag &= ~WAL_ITEM_HAS_FULL_DOC;
+                return FDB_RESULT_ALLOC_FAIL;
+            } // LCOV_EXCL_STOP
+            memcpy(item->doc_body->meta, doc->meta, doc->metalen);
+            item->doc_body->metalen = doc->metalen;
+        }
+        if (doc->bodylen) {
+            item->doc_body->body = realloc(item->doc_body->body,
+                                           doc->bodylen);
+            if (!item->doc_body->body) { // LCOV_EXCL_START
+                free(item->doc_body->meta);
+                free(item->doc_body->body);
+                free(item->doc_body);
+                item->flag &= ~WAL_ITEM_OFF_IS_BODY;
+                item->flag &= ~WAL_ITEM_HAS_FULL_DOC;
+                return FDB_RESULT_ALLOC_FAIL;
+            } // LCOV_EXCL_STOP
+            memcpy(item->doc_body->body, doc->body, doc->bodylen);
+            item->doc_body->bodylen = doc->bodylen;
+        }
+    }
+    item->flag |= WAL_ITEM_HAS_FULL_DOC;
+    return FDB_RESULT_SUCCESS;
+}
+
+INLINE void _wal_make_cached_doc_item(wal_item *item, fdb_doc *doc) {
+    if (item->flag & WAL_ITEM_OFF_IS_BODY) {
+        doc->bodylen = item->doc_size - item->header->keylen
+                     - DOCIO_OVERHEAD_BYTES;
+        doc->body = &item->_body;
+        doc->metalen = 0;
+    } else {
+        doc->metalen = item->doc_body->metalen;
+        doc->bodylen = item->doc_body->bodylen;
+        doc->meta = item->doc_body->meta;
+        doc->body = item->doc_body->body;
+    }
+    doc->key = item->header->key;
+    doc->keylen = item->header->keylen;
+    doc->seqnum = item->seqnum;
+    doc->size_ondisk = item->doc_size;
+    doc->deleted = (item->action == WAL_ACT_LOGICAL_REMOVE ||
+                    item->action == WAL_ACT_REMOVE) ? true : false;
+    doc->offset = BLK_NOT_FOUND;
+}
+
+INLINE fdb_status _wal_get_cached_doc_item(wal_item *item, fdb_doc *doc,
+                                           bool copy_key) {
+    if (copy_key) {
+        if (!doc->key) {
+            doc->key = malloc(doc->keylen);
+        }
+        doc->keylen = item->header->keylen;
+        memcpy(doc->key, item->header->key, doc->keylen);
+    }
+    if (item->flag & WAL_ITEM_OFF_IS_BODY) {
+        // TODO: Depends on _fdb_get_docsize.. make generic..
+        doc->bodylen = item->doc_size - item->header->keylen
+                     - DOCIO_OVERHEAD_BYTES;
+        if (!doc->body) {
+            doc->body = malloc(doc->bodylen);
+        }
+        memcpy(doc->body, &item->_body, doc->bodylen);
+        doc->metalen = 0;
+    } else {
+        doc->metalen = item->doc_body->metalen;
+        doc->bodylen = item->doc_body->bodylen;
+        if (doc->metalen) {
+            if (!doc->meta) {
+                doc->meta = malloc(doc->metalen);
+            }
+            memcpy(doc->meta, item->doc_body->meta, doc->metalen);
+        }
+        if (doc->bodylen) {
+            if (!doc->body) {
+                doc->body = malloc(doc->bodylen);
+            }
+            memcpy(doc->body, item->doc_body->body, doc->bodylen);
+        }
+    }
+    doc->offset = BLK_NOT_FOUND;
+    doc->seqnum = item->seqnum;
+    doc->size_ondisk = item->doc_size;
+    return FDB_RESULT_SUCCESS;
+}
+
+INLINE void _wal_free_cached_doc_item(wal_item *item) {
+    if (item->flag & WAL_ITEM_HAS_FULL_DOC &&
+        !item->flag & WAL_ITEM_OFF_IS_BODY) {
+        free(item->doc_body->meta);
+        free(item->doc_body->body);
+        free(item->doc_body);
+    }
+    item->flag &= ~WAL_ITEM_OFF_IS_BODY;
+    item->flag &= ~WAL_ITEM_HAS_FULL_DOC;
+}
+
 INLINE fdb_status _wal_insert(fdb_txn *txn,
                               struct filemgr *file,
                               fdb_doc *doc,
                               uint64_t offset,
-                              wal_insert_by caller,
+                              uint8_t ins_flags,
                               bool immediate_remove)
 {
     struct wal_item *item;
@@ -151,7 +308,7 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
     query.keylen = keylen;
     chk_sum = get_checksum((uint8_t*)key, keylen);
     shard_num = chk_sum % file->wal->num_shards;
-    if (caller == WAL_INS_WRITER) {
+    if (ins_flags & WAL_INS_WRITER) {
         spin_lock(&file->wal->key_shards[shard_num].lock);
     }
 
@@ -172,23 +329,23 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
                 // overwrite existing WAL item
 
                 size_t seq_shard_num = item->seqnum % file->wal->num_shards;
-                if (caller == WAL_INS_WRITER) {
+                if (ins_flags & WAL_INS_WRITER) {
                     spin_lock(&file->wal->seq_shards[seq_shard_num].lock);
                 }
                 avl_remove(&file->wal->seq_shards[seq_shard_num].map_byseq,
                            &item->avl_seq);
-                if (caller == WAL_INS_WRITER) {
+                if (ins_flags & WAL_INS_WRITER) {
                     spin_unlock(&file->wal->seq_shards[seq_shard_num].lock);
                 }
 
                 item->seqnum = doc->seqnum;
                 seq_shard_num = doc->seqnum % file->wal->num_shards;
-                if (caller == WAL_INS_WRITER) {
+                if (ins_flags & WAL_INS_WRITER) {
                     spin_lock(&file->wal->seq_shards[seq_shard_num].lock);
                 }
                 avl_insert(&file->wal->seq_shards[seq_shard_num].map_byseq,
                            &item->avl_seq, _wal_cmp_byseq);
-                if (caller == WAL_INS_WRITER) {
+                if (ins_flags & WAL_INS_WRITER) {
                     spin_unlock(&file->wal->seq_shards[seq_shard_num].lock);
                 }
 
@@ -224,7 +381,12 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
                 atomic_add_uint64_t(&file->wal->datasize,
                                     doc_size_ondisk - item->doc_size);
                 item->doc_size = doc->size_ondisk;
-                item->offset = offset;
+                if (ins_flags & WAL_INS_CACHE_FULL_DOC) {
+                    _wal_update_cached_doc_item(item, doc); // De-Dupe!!
+                } else {
+                    _wal_free_cached_doc_item(item);
+                    item->offset = offset;
+                }
 
                 // move the item to the front of the list (header)
                 list_remove(&header->items, &item->list_elem);
@@ -268,19 +430,24 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
             } else {
                 item->action = WAL_ACT_INSERT;
             }
-            item->offset = offset;
+
+            if (ins_flags & WAL_INS_CACHE_FULL_DOC) {
+                _wal_cache_doc_item(item, doc);
+            } else {
+                item->offset = offset;
+            }
             item->doc_size = doc->size_ondisk;
             if (item->action != WAL_ACT_REMOVE) {
                 atomic_add_uint64_t(&file->wal->datasize, doc->size_ondisk);
             }
 
             size_t seq_shard_num = doc->seqnum % file->wal->num_shards;
-            if (caller == WAL_INS_WRITER) {
+            if (ins_flags & WAL_INS_WRITER) {
                 spin_lock(&file->wal->seq_shards[seq_shard_num].lock);
             }
             avl_insert(&file->wal->seq_shards[seq_shard_num].map_byseq,
                       &item->avl_seq, _wal_cmp_byseq);
-            if (caller == WAL_INS_WRITER) {
+            if (ins_flags & WAL_INS_WRITER) {
                 spin_unlock(&file->wal->seq_shards[seq_shard_num].lock);
             }
             // insert into header's list
@@ -306,7 +473,7 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
 
         item = (struct wal_item *)malloc(sizeof(struct wal_item));
         // entries inserted by compactor is already committed
-        if (caller == WAL_INS_COMPACT_PHASE1) {
+        if (ins_flags & WAL_INS_COMPACT_PHASE1) {
             item->flag = WAL_ITEM_COMMITTED | WAL_ITEM_BY_COMPACTOR;
         } else {
             item->flag = 0x0;
@@ -339,7 +506,11 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
         } else {
             item->action = WAL_ACT_INSERT;
         }
-        item->offset = offset;
+        if (ins_flags & WAL_INS_CACHE_FULL_DOC) {
+            _wal_cache_doc_item(item, doc);
+        } else {
+            item->offset = offset;
+        }
         item->doc_size = doc->size_ondisk;
         if (item->action != WAL_ACT_REMOVE) {
             atomic_add_uint64_t(&file->wal->datasize, doc->size_ondisk);
@@ -347,18 +518,19 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
 
         size_t seq_shard_num;
         seq_shard_num = doc->seqnum % file->wal->num_shards;
-        if (caller == WAL_INS_WRITER) {
+        if (ins_flags & WAL_INS_WRITER) {
             spin_lock(&file->wal->seq_shards[seq_shard_num].lock);
         }
         avl_insert(&file->wal->seq_shards[seq_shard_num].map_byseq,
                    &item->avl_seq, _wal_cmp_byseq);
-        if (caller == WAL_INS_WRITER) {
+        if (ins_flags & WAL_INS_WRITER) {
             spin_unlock(&file->wal->seq_shards[seq_shard_num].lock);
         }
 
         // insert into header's list
         list_push_front(&header->items, &item->list_elem);
-        if (caller == WAL_INS_WRITER || caller == WAL_INS_COMPACT_PHASE2) {
+        if (ins_flags & WAL_INS_WRITER ||
+            ins_flags & WAL_INS_COMPACT_PHASE2) {
             // also insert into transaction's list
             list_push_back(txn->items, &item->list_elem_txn);
         } else {
@@ -371,7 +543,7 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
             sizeof(struct wal_item) + sizeof(struct wal_item_header) + keylen);
     }
 
-    if (caller == WAL_INS_WRITER) {
+    if (ins_flags & WAL_INS_WRITER) {
         spin_unlock(&file->wal->key_shards[shard_num].lock);
     }
 
@@ -382,7 +554,7 @@ fdb_status wal_insert(fdb_txn *txn,
                       struct filemgr *file,
                       fdb_doc *doc,
                       uint64_t offset,
-                      wal_insert_by caller)
+                      uint8_t caller)
 {
     return _wal_insert(txn, file, doc, offset, caller, false);
 }
@@ -391,7 +563,7 @@ fdb_status wal_immediate_remove(fdb_txn *txn,
                                 struct filemgr *file,
                                 fdb_doc *doc,
                                 uint64_t offset,
-                                wal_insert_by caller)
+                                uint8_t caller)
 {
     return _wal_insert(txn, file, doc, offset, caller, true);
 }
@@ -411,7 +583,6 @@ static fdb_status _wal_find(fdb_txn *txn,
 
     if (doc->seqnum == SEQNUM_NOT_USED || (key && keylen>0)) {
         size_t chk_sum = get_checksum((uint8_t*)key, keylen);
-        // _wal_find() doesn't care compactor's shard
         size_t shard_num = chk_sum % file->wal->num_shards;
         spin_lock(&file->wal->key_shards[shard_num].lock);
         // search by key
@@ -431,7 +602,6 @@ static fdb_status _wal_find(fdb_txn *txn,
                 if ((item->flag & WAL_ITEM_COMMITTED) ||
                     (item->txn == txn) ||
                     (txn->isolation == FDB_ISOLATION_READ_UNCOMMITTED)) {
-                    *offset = item->offset;
                     if (item->action == WAL_ACT_INSERT) {
                         doc->deleted = false;
                     } else {
@@ -446,6 +616,12 @@ static fdb_status _wal_find(fdb_txn *txn,
                             // metadata from file.
                             *offset = BLK_NOT_FOUND;
                         }
+                    }
+                    if (item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                        _wal_get_cached_doc_item(item, doc, false);
+                        *offset = BLK_NOT_FOUND;
+                    } else {
+                        *offset = item->offset;
                     }
                     spin_unlock(&file->wal->key_shards[shard_num].lock);
                     return FDB_RESULT_SUCCESS;
@@ -474,7 +650,6 @@ static fdb_status _wal_find(fdb_txn *txn,
             if ((item->flag & WAL_ITEM_COMMITTED) ||
                 (item->txn == txn) ||
                 (txn->isolation == FDB_ISOLATION_READ_UNCOMMITTED)) {
-                *offset = item->offset;
                 if (item->action == WAL_ACT_INSERT) {
                     doc->deleted = false;
                 } else {
@@ -489,6 +664,12 @@ static fdb_status _wal_find(fdb_txn *txn,
                         // metadata from file.
                         *offset = BLK_NOT_FOUND;
                     }
+                }
+                if (item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                    _wal_get_cached_doc_item(item, doc, true);
+                    *offset = BLK_NOT_FOUND;
+                } else {
+                    *offset = item->offset;
                 }
                 spin_unlock(&file->wal->seq_shards[shard_num].lock);
                 return FDB_RESULT_SUCCESS;
@@ -549,6 +730,10 @@ fdb_status wal_txn_migration(void *dbhandle,
                 if (!(item->flag & WAL_ITEM_COMMITTED)) {
                     // not committed yet
                     // move doc
+                    if (item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                        memset(&doc, 0, sizeof(fdb_doc));
+                        _wal_get_cached_doc_item(item, &doc, true);
+                    }
                     offset = move_doc(dbhandle, new_dhandle, item, &doc);
                     // Note that all items belonging to global_txn should be
                     // flushed before calling this function
@@ -630,7 +815,10 @@ fdb_status wal_txn_migration(void *dbhandle,
 }
 
 fdb_status wal_commit(fdb_txn *txn, struct filemgr *file,
-                      wal_commit_mark_func *func, err_log_callback *log_callback)
+                      wal_doc_persist_func *write_func,
+                      void *write_handle,
+                      wal_commit_mark_func *mark_func,
+                      err_log_callback *log_callback)
 {
     int prev_commit;
     wal_item_action prev_action;
@@ -661,9 +849,27 @@ fdb_status wal_commit(fdb_txn *txn, struct filemgr *file,
             }
 
             item->flag |= WAL_ITEM_COMMITTED;
+            if (item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                fdb_doc _doc;
+                uint64_t offset;
+                _wal_make_cached_doc_item(item, &_doc);
+                offset = write_func(write_handle, &_doc, _doc.deleted,
+                                    item->txn != &file->global_txn);
+                if (offset == BLK_NOT_FOUND) {
+                    fdb_log(log_callback, status,
+                            "Error in appending a doc keylen %u metalen %u "
+                            "bodylen %u seqnum %" _F64 " in a database file "
+                            "'%s'", _doc.keylen, _doc.metalen, _doc.bodylen,
+                            _doc.seqnum, file->filename);
+                    spin_unlock(&file->wal->key_shards[shard_num].lock);
+                    return status;
+                }
+                _wal_free_cached_doc_item(item);
+                item->offset = offset;
+            }
             // append commit mark if necessary
-            if (func) {
-                status = func(txn->handle, item->offset);
+            if (mark_func) {
+                status = mark_func(txn->handle, item->offset);
                 if (status != FDB_RESULT_SUCCESS) {
                     fdb_log(log_callback, status,
                             "Error in appending a commit mark at offset %" _F64 " in "
@@ -1110,13 +1316,18 @@ fdb_status wal_snapshot(struct filemgr *file,
                     }
                 }
 
-                doc.keylen = item->header->keylen;
+                if (item->flag & WAL_ITEM_HAS_FULL_DOC) {
+                    _wal_make_cached_doc_item(item, &doc);
+                } else {
+                    doc.keylen = item->header->keylen;
+                    doc.seqnum = item->seqnum;
+                    doc.deleted = (item->action == WAL_ACT_LOGICAL_REMOVE ||
+                                  item->action == WAL_ACT_REMOVE);
+                    doc.offset = item->offset;
+                }
                 doc.key = malloc(doc.keylen); // (freed in fdb_snapshot_close)
                 memcpy(doc.key, item->header->key, doc.keylen);
-                doc.seqnum = item->seqnum;
-                doc.deleted = (item->action == WAL_ACT_LOGICAL_REMOVE ||
-                               item->action == WAL_ACT_REMOVE);
-                snapshot_func(dbhandle, &doc, item->offset);
+                snapshot_func(dbhandle, &doc, doc.offset);
                 if (doc.seqnum > copied_seq) {
                     copied_seq = doc.seqnum;
                 }
@@ -1265,6 +1476,7 @@ static fdb_status _wal_close(struct filemgr *file,
                     if (item->txn == &file->global_txn) {
                         atomic_decr_uint32_t(&file->wal->num_flushable);
                     }
+                    _wal_free_cached_doc_item(item);
                     free(item);
                     atomic_decr_uint32_t(&file->wal->size);
                     mem_overhead += sizeof(struct wal_item);

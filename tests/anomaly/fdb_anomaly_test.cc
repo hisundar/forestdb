@@ -101,6 +101,7 @@ void write_failure_test()
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.purging_interval = 0;
     fconfig.compaction_threshold = 0;
+    fconfig.enable_deduplication = false; // needed for # writes before failure
 
     keylen_limit = fconfig.blocksize - 256;
     keybuf = alca(char, keylen_limit);

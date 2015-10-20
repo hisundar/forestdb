@@ -3698,7 +3698,11 @@ void iterator_offset_access_test()
 
         // get by offset
         s = fdb_get_byoffset(db, doc[i]);
-        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        if (fconfig.enable_deduplication) {
+            TEST_CHK(s == FDB_RESULT_INVALID_ARGS);
+        } else {
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+        }
 
         // seek to in verificaiton db
         s = fdb_iterator_seek(it, doc[i]->key, doc[i]->keylen, 0);
@@ -3731,11 +3735,12 @@ void iterator_offset_access_test()
     for (i=n/2;i<n;i+=10){
 
         // verify can get by offset from main db
-        s = fdb_get_byoffset(db, doc[i]);
-        TEST_CHK(s == FDB_RESULT_KEY_NOT_FOUND);
-
-        // should be deleted now at new offset
-        TEST_CHK(doc[i]->deleted == true);
+        if (doc[i]->offset != uint64_t(-1)) {
+            s = fdb_get_byoffset(db, doc[i]);
+            TEST_CHK(s == FDB_RESULT_KEY_NOT_FOUND);
+            // should be deleted now at new offset
+            TEST_CHK(doc[i]->deleted == true);
+        }
     }
 
     for(i=0;i<n;++i){

@@ -206,6 +206,20 @@ struct filemgr {
     struct list *stale_list;
 };
 
+#ifdef __CRC32
+#  ifdef DOCIO_LEN_STRUCT_ALIGN
+#    define DOCIO_OVERHEAD_BYTES 32
+#  else
+#    define DOCIO_OVERHEAD_BYTES 30
+#  endif
+#else
+#  ifdef DOCIO_LEN_STRUCT_ALIGN
+#    define DOCIO_OVERHEAD_BYTES 30
+#  else
+#    define DOCIO_OVERHEAD_BYTES 28
+#  endif
+#endif
+
 typedef fdb_status (*register_file_removal_func)(struct filemgr *file,
                                                  err_log_callback *log_callback);
 typedef bool (*check_file_removal_func)(const char *filename);
