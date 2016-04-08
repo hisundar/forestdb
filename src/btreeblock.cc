@@ -1321,3 +1321,36 @@ fdb_status btreeblk_end(struct btreeblk_handle *handle)
     }
     return status;
 }
+
+void _dbg_btreeblk_print_all(void *voidhandle)
+{
+    struct btreeblk_handle *handle = (struct btreeblk_handle *)voidhandle;
+
+    // alc list
+    struct list_elem *e;
+    struct btreeblk_block *block;
+
+    // print all blocks in alc list
+    e = list_begin(&handle->alc_list);
+    while(e) {
+        block = _get_entry(e, struct btreeblk_block, le);
+        e = list_next(&block->le);
+
+        fprintf(stderr, "block %" _X64 " (alc_list)\n", block->bid);
+        dbg_print_buf(block, sizeof(struct btreeblk_block), true, 16);
+        dbg_print_buf(block->addr, 4096, true, 16);
+    }
+
+    // print all blocks in read list
+    e = list_begin(&handle->read_list);
+    while(e) {
+        block = _get_entry(e, struct btreeblk_block, le);
+        e = list_next(&block->le);
+
+        fprintf(stderr, "block %" _X64 " (read_list)\n", block->bid);
+        dbg_print_buf(block, sizeof(struct btreeblk_block), true, 16);
+        dbg_print_buf(block->addr, 4096, true, 16);
+    }
+
+}
+

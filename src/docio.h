@@ -37,6 +37,7 @@ struct docio_handle {
     void *readbuffer;
     err_log_callback *log_callback;
     bool compress_document_body;
+    fdb_kvs_handle *kvs_handle;
 };
 
 #define DOCIO_NORMAL (0x00)

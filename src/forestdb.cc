@@ -44,6 +44,7 @@
 #include "memleak.h"
 #include "time_utils.h"
 #include "system_resource_stats.h"
+#include "blockcache.h"
 
 #ifdef __DEBUG
 #ifndef __DEBUG_FDB
@@ -91,11 +92,65 @@ INLINE int _cmp_uint64_t_endian_safe(void *key1, void *key2, void *aux)
     return _CMP_U64(a, b);
 }
 
+void _dbg_print_all_kvs_handle(fdb_file_handle *fhandle);
 size_t _fdb_readkey_wrap(void *handle, uint64_t offset, void *buf)
 {
-    keylen_t keylen;
+    keylen_t keylen = 0;
     offset = _endian_decode(offset);
     docio_read_doc_key((struct docio_handle *)handle, offset, &keylen, buf);
+    if (keylen == 0) {
+        int r;
+        bid_t target_bid = offset / 4096;
+        fdb_kvs_handle *kvs_handle;
+        fdb_file_handle *fhandle;
+        struct docio_handle *dhandle = (struct docio_handle *)handle;
+        struct filemgr *file = dhandle->file;
+        uint8_t temp_buf[4096];
+
+        fprintf(stderr, "[FDB ERR] docio_read_doc_key fail "
+            "file %s offset %" _X64 " buf %" _X64 " readbuffer %" _X64 " "
+            "curblock %" _X64 " curpos %x lastbid %" _X64 " \n",
+            file->filename, offset, (uint64_t)buf, (uint64_t)dhandle->readbuffer,
+            dhandle->curblock, dhandle->curpos, dhandle->lastbid);
+        fprintf(stderr, "read buffer: \n");
+        dbg_print_buf(dhandle->readbuffer, 4096, true, 16);
+
+        // try to get the block from block cache
+        if (file->config->ncacheblock) {
+            r = bcache_read(file, target_bid, temp_buf);
+            if (r == 0) {
+                fprintf(stderr, "cache miss: BID %" _X64 "\n", target_bid);
+            } else {
+                fprintf(stderr, "block (from cache): \n");
+                dbg_print_buf(temp_buf, 4096, true, 16);
+            }
+        }
+
+        // read the block from file
+        r = file->ops->pread(file->fd, temp_buf, file->blocksize, target_bid * 4096);
+        if (r != (int)file->blocksize) {
+            fprintf(stderr, "fail to read from file: BID %" _X64 ", r: %d\n", target_bid, r);
+        } else {
+            fprintf(stderr, "block (from file): \n");
+            dbg_print_buf(temp_buf, 4096, true, 16);
+        }
+
+        kvs_handle = dhandle->kvs_handle;
+        if (kvs_handle) {
+            fhandle = kvs_handle->fhandle;
+
+            fprintf(stderr, "KVS handle (id %" _F64 "): \n", kvs_handle->kvs->id);
+            dbg_print_buf(kvs_handle, sizeof(fdb_kvs_handle), true, 16);
+
+            fprintf(stderr, "fhandle: \n");
+            dbg_print_buf(fhandle, sizeof(fdb_file_handle), true, 16);
+            _dbg_print_all_kvs_handle(fhandle);
+        }
+
+        fprintf(stderr, "file: \n");
+        dbg_print_buf(dhandle->file, sizeof(struct filemgr), true, 16);
+
+    }
     return keylen;
 }
 
@@ -473,6 +528,10 @@ INLINE fdb_status _fdb_recover_compaction(fdb_kvs_handle *handle,
         }
         // remove self: WARNING must not close this handle if snapshots
         // are yet to open this file
+        fprintf(stderr, "[FDB INFO] _fdb_recover_compaction closed file %s (%d) "
+            "ref count %u / new file %s (%d) ref count %u\n",
+            old_file->filename, old_file->fd, old_file->ref_count,
+            new_db.file->filename, new_db.file->fd, new_db.file->ref_count);
         filemgr_remove_pending(old_file, new_db.file);
         filemgr_close(old_file, 0, handle->filename, &handle->log_callback);
         free(new_db.filename);
@@ -482,6 +541,11 @@ INLINE fdb_status _fdb_recover_compaction(fdb_kvs_handle *handle,
     // As the new file is partially compacted, it should be removed upon close.
     // Just in-case the new file gets opened before removal, point it to the old
     // file to ensure availability of data.
+    fprintf(stderr, "[FDB INFO] _fdb_recover_compaction closed "
+        "new (incomplete) file %s (%d) ref count %u / "
+        "old file %s (%d) ref count %u\n",
+        new_db.file->filename, new_db.file->fd, new_db.file->ref_count,
+        handle->file->filename, handle->file->fd, handle->file->ref_count);
     filemgr_remove_pending(new_db.file, handle->file);
     _fdb_close(&new_db);
 
@@ -1108,6 +1172,7 @@ fdb_status _fdb_clone_snapshot(fdb_kvs_handle *handle_in,
     handle_out->dhandle->log_callback = &handle_out->log_callback;
     docio_init(handle_out->dhandle, handle_out->file,
                handle_out->config.compress_document_body);
+    handle_out->dhandle->kvs_handle = handle_out;
 
     // initialize the btree block handle.
     handle_out->btreeblkops = btreeblk_get_ops();
@@ -1301,6 +1366,7 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
                       calloc(1, sizeof(struct docio_handle));
     handle->dhandle->log_callback = &handle->log_callback;
     docio_init(handle->dhandle, handle->file, config->compress_document_body);
+    handle->dhandle->kvs_handle = handle;
 
     if (header_len > 0) {
         fdb_fetch_header(header_buf, &trie_root_bid,
@@ -1664,6 +1730,10 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
                                                           &fconfig,
                                                           NULL);
                 if (result.file) {
+                    fprintf(stderr, "[FDB INFO] handling prev_file logic closed file %s (%d) "
+                        "ref count %u / new file %s (%d) ref count %u\n",
+                        result.file->filename, result.file->fd, result.file->ref_count,
+                        handle->file->filename, handle->file->fd, handle->file->ref_count);
                     filemgr_remove_pending(result.file, handle->file);
                     filemgr_close(result.file, 0, handle->filename,
                                   &handle->log_callback);
@@ -3476,6 +3546,10 @@ static fdb_status _fdb_commit_and_remove_pending(fdb_kvs_handle *handle,
             // I/O errors here are not propogated since this is best-effort
             // Since filemgr_search_stale_links() will have opened the file
             // we must close it here to ensure decrement of ref counter
+            fprintf(stderr, "[FDB INFO] handling ver_old_file logic closed file %s (%d) "
+                "ref count %u / new file %s (%d) ref count %u\n",
+                very_old_file->filename, very_old_file->fd, very_old_file->ref_count,
+                handle->file->filename, handle->file->fd, handle->file->ref_count);
             filemgr_close(very_old_file, 1, very_old_file->filename,
                           &handle->log_callback);
         }
@@ -4602,6 +4676,10 @@ static void _fdb_cleanup_compact_err(fdb_kvs_handle *handle,
     if (got_lock) {
         filemgr_mutex_unlock(new_file);
     }
+    fprintf(stderr, "[FDB INFO] _fdb_cleanup_compact_err closed file %s (%d) "
+        "ref count %u\n",
+        new_file->filename, new_file->fd, new_file->ref_count);
+
     filemgr_close(new_file, cleanup_cache, new_file->filename,
                   &handle->log_callback);
     // Free all the resources allocated in this function.
@@ -4661,6 +4739,7 @@ static fdb_status _fdb_reset(fdb_kvs_handle *handle, fdb_kvs_handle *handle_in)
     docio_init(new_dhandle, handle->file,
                handle->config.compress_document_body);
     btreeblk_init(new_bhandle, handle->file, handle->file->blocksize);
+    new_dhandle->kvs_handle = handle;
 
     new_trie = (struct hbtrie *)malloc(sizeof(struct hbtrie));
     if (!new_trie) { // LCOV_EXCL_START
@@ -4860,6 +4939,7 @@ fdb_status fdb_compact_file(fdb_file_handle *fhandle,
 
     docio_init(new_dhandle, new_file, handle->config.compress_document_body);
     btreeblk_init(new_bhandle, new_file, new_file->blocksize);
+    new_dhandle->kvs_handle = handle;
 
     new_trie = (struct hbtrie *)malloc(sizeof(struct hbtrie));
     hbtrie_init(new_trie, handle->trie->chunksize, handle->trie->valuelen,

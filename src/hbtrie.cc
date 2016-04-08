@@ -1509,6 +1509,8 @@ static void _hbtrie_extend_leaf_tree(struct hbtrie *trie,
 
 }
 
+void _dbg_btreeblk_print_all(void *voidhandle);
+
 // suppose that VALUE and OLDVALUE_OUT are based on the same endian in hb+trie
 #define HBTRIE_PARTIAL_UPDATE (0x1)
 INLINE hbtrie_result _hbtrie_insert(struct hbtrie *trie,
@@ -1815,6 +1817,49 @@ INLINE hbtrie_result _hbtrie_insert(struct hbtrie *trie,
 
         // read entire key
         docrawkeylen = trie->readkey(trie->doc_handle, offset, docrawkey);
+        if (docrawkeylen == 0) {
+            // it means that 'rsize' assertion will occur next
+
+            fprintf(stderr, "trie root: %" _X64 "\n", trie->root_bid);
+            fprintf(stderr, "trie structure:\n");
+            dbg_print_buf(trie, sizeof(struct hbtrie), true, 16);
+
+            fprintf(stderr, "rawkey (%d):\n", rawkeylen);
+            dbg_print_buf(rawkey, rawkeylen ,true, 16);
+
+            fprintf(stderr, "reformed key (%d):\n", keylen);
+            dbg_print_buf(key, keylen ,true, 16);
+
+            fprintf(stderr, "curchunkno: %d\n", curchunkno);
+
+            // print chunk
+            fprintf(stderr, "chunk: \n");
+            dbg_print_buf(chunk, 8, true, 16);
+
+            struct list_elem *e;
+            struct btreelist_item *cur_item;
+            e = list_begin(&btreelist);
+            while (e) {
+                cur_item = _get_entry(e, struct btreelist_item, e);
+                e = list_next(&cur_item->e);
+
+                fprintf(stderr, "btree root: %" _X64 "\n", cur_item->btree.root_bid);
+                // print btree structure
+                fprintf(stderr, "btree structure:\n");
+                dbg_print_buf(&cur_item->btree, sizeof(struct btreelist_item), true, 16);
+            }
+
+            // search b-tree again
+            r = btree_find(&btreeitem->btree, chunk, btree_value);
+
+            fprintf(stderr, "btree_find result: %d\n", r);
+
+            // print btree_value
+            fprintf(stderr, "btree_value: \n");
+            dbg_print_buf(btree_value, 8, true, 16);
+
+            _dbg_btreeblk_print_all(trie->btreeblk_handle);
+        }
         dockeylen = _hbtrie_reform_key(trie, docrawkey, docrawkeylen, dockey);
 
         // find first different chunk

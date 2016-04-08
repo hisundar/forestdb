@@ -2240,3 +2240,21 @@ fdb_status fdb_free_kvs_name_list(fdb_kvs_name_list *kvs_name_list)
 
     return FDB_RESULT_SUCCESS;
 }
+
+void _dbg_print_all_kvs_handle(fdb_file_handle *fhandle)
+{
+    struct list_elem *e;
+    struct kvs_opened_node *node;
+
+    fprintf(stderr, "KVS handle (root): \n");
+    dbg_print_buf(fhandle->root, sizeof(fdb_kvs_handle), true, 16);
+
+    e = list_begin(fhandle->handles);
+    while (e) {
+        node = _get_entry(e, struct kvs_opened_node, le);
+        e = list_next(e);
+        fprintf(stderr, "KVS handle (id %" _F64 "): \n", node->handle->kvs->id);
+        dbg_print_buf(node->handle, sizeof(fdb_kvs_handle), true, 16);
+    }
+}
+

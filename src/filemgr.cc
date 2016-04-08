@@ -683,6 +683,9 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
     cs_off_t offset = file->ops->goto_eof(file->fd);
     if (offset == FDB_RESULT_SEEK_FAIL) {
         _log_errno_str(file->ops, log_callback, FDB_RESULT_SEEK_FAIL, "SEEK_END", filename);
+        fprintf(stderr, "[FDB INFO] file %s (%d) closed "
+            "ref count %u (filemgr_open, SEEK_FAIL)\n",
+            file->filename, file->fd, file->ref_count);
         file->ops->close(file->fd);
         free(file->wal);
         free(file->filename);
@@ -708,6 +711,9 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
     status = _filemgr_read_header(file, log_callback);
     if (status != FDB_RESULT_SUCCESS) {
         _log_errno_str(file->ops, log_callback, status, "READ", filename);
+        fprintf(stderr, "[FDB INFO] file %s (%d) closed "
+            "ref count %u (filemgr_open, read header fail)\n",
+            file->filename, file->fd, file->ref_count);
         file->ops->close(file->fd);
         free(file->wal);
         free(file->filename);
@@ -1104,6 +1110,9 @@ fdb_status filemgr_close(struct filemgr *file, bool cleanup_cache_onclose,
         }
 
         spin_lock(&file->lock);
+        fprintf(stderr, "[FDB INFO] file %s (%d) closed "
+            "ref count %u (filemgr_close)\n",
+            file->filename, file->fd, file->ref_count);
         rv = file->ops->close(file->fd);
         if (atomic_get_uint8_t(&file->status) == FILE_REMOVED_PENDING) {
             _log_errno_str(file->ops, log_callback, (fdb_status)rv, "CLOSE", file->filename);
@@ -1522,6 +1531,10 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
                     spin_unlock(&file->data_spinlock[lock_no]);
 #endif //__FILEMGR_DATA_PARTIAL_LOCK
                 }
+                fprintf(stderr, "[FDB ERR] read fail (read_on_cache_miss) file %s "
+                    "BID %" _F64 " buf %" _X64 "\n",
+                    file->filename, bid, (uint64_t)buf);
+                dbg_print_buf(buf, 4096, true, 16);
                 return FDB_RESULT_READ_FAIL;
             }
 
@@ -1539,6 +1552,13 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
                     spin_unlock(&file->data_spinlock[lock_no]);
 #endif //__FILEMGR_DATA_PARTIAL_LOCK
                 }
+                fprintf(stderr, "[FDB ERR] read fail (pread error) file %s "
+                    "BID %" _F64 " buf %" _X64 " r %ld\n",
+                    file->filename, bid, (uint64_t)buf, r);
+                char errmsg[512];
+                file->ops->get_errno_str(errmsg, 512);
+                fprintf(stderr, "[FDB ERR] %s\n", errmsg);
+                dbg_print_buf(buf, 4096, true, 16);
                 return (r < 0)? (fdb_status)r : FDB_RESULT_READ_FAIL;
             }
 #ifdef __CRC32
@@ -1555,6 +1575,10 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
                     spin_unlock(&file->data_spinlock[lock_no]);
 #endif //__FILEMGR_DATA_PARTIAL_LOCK
                 }
+                fprintf(stderr, "[FDB ERR] read fail (checksum error) file %s "
+                    "BID %" _F64 " buf %" _X64 "\n",
+                    file->filename, bid, (uint64_t)buf);
+                dbg_print_buf(buf, 4096, true, 16);
                 return status;
             }
 #endif
@@ -1571,6 +1595,10 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
                 }
                 _log_errno_str(file->ops, log_callback,
                                (fdb_status) r, "WRITE", file->filename);
+                fprintf(stderr, "[FDB ERR] read fail (bcache write fail) file %s "
+                    "BID %" _F64 " buf %" _X64 "\n",
+                    file->filename, bid, (uint64_t)buf);
+                dbg_print_buf(buf, 4096, true, 16);
                 return FDB_RESULT_WRITE_FAIL;
             }
         }
@@ -1585,6 +1613,10 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
         }
     } else {
         if (!read_on_cache_miss) {
+            fprintf(stderr, "[FDB ERR] read fail (read_on_cache_miss, cache disabled) file %s "
+                "BID %" _F64 " buf %" _X64 "\n",
+                file->filename, bid, (uint64_t)buf);
+            dbg_print_buf(buf, 4096, true, 16);
             return FDB_RESULT_READ_FAIL;
         }
 
@@ -1592,6 +1624,13 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
         if (r != file->blocksize) {
             _log_errno_str(file->ops, log_callback, (fdb_status) r, "READ",
                            file->filename);
+            fprintf(stderr, "[FDB ERR] read fail (pread error, cache disabled) file %s "
+                "BID %" _F64 " buf %" _X64 " r %ld\n",
+                file->filename, bid, (uint64_t)buf, r);
+            char errmsg[512];
+            file->ops->get_errno_str(errmsg, 512);
+            fprintf(stderr, "[FDB ERR] %s\n", errmsg);
+            dbg_print_buf(buf, 4096, true, 16);
             return (r < 0)? (fdb_status)r : FDB_RESULT_READ_FAIL;
         }
 
@@ -1600,6 +1639,10 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
         if (status != FDB_RESULT_SUCCESS) {
             _log_errno_str(file->ops, log_callback, status, "READ",
                            file->filename);
+            fprintf(stderr, "[FDB ERR] read fail (checksum error, cache disabled) file %s "
+                "BID %" _F64 " buf %" _X64 "\n",
+                file->filename, bid, (uint64_t)buf);
+            dbg_print_buf(buf, 4096, true, 16);
             return status;
         }
 #endif
@@ -2086,6 +2129,9 @@ fdb_status filemgr_destroy_file(char *filename,
                     if (!destroy_file_set) { // top level or non-recursive call
                         hash_free(destroy_set);
                     }
+                    fprintf(stderr, "[FDB INFO] file %s (%d) closed "
+                        "ref count %u (filemgr_destroy, read header fail)\n",
+                        file->filename, file->fd, file->ref_count);
                     file->ops->close(file->fd);
                     return status;
                 }
@@ -2106,6 +2152,9 @@ fdb_status filemgr_destroy_file(char *filename,
                     }
                     free(file->header.data);
                 }
+                fprintf(stderr, "[FDB INFO] file %s (%d) closed "
+                    "ref count %u (filemgr_destroy)\n",
+                    file->filename, file->fd, file->ref_count);
                 file->ops->close(file->fd);
                 if (status == FDB_RESULT_SUCCESS) {
                     if (filemgr_does_file_exist(filename)

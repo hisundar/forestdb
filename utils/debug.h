@@ -2,6 +2,7 @@
 #define _JSAHN_DEBUG_H
 
 #include <stdint.h>
+#include <stdlib.h>
 
 #ifdef __DEBUG
     #include <stdio.h>
@@ -24,5 +25,8 @@ void * _dbg_get_addr(int n);
 
 void _dbg_set_uint64_t(int n, uint64_t val);
 uint64_t _dbg_get_uint64_t(int n);
+
+void dbg_print_buf(void *buf, uint64_t buflen, bool hex, int align);
+
 
 #endif
