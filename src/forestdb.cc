@@ -43,6 +43,7 @@
 #include "compactor.h"
 #include "memleak.h"
 #include "time_utils.h"
+#include "timing.h"
 #include "system_resource_stats.h"
 #include "blockcache.h"
 
@@ -817,6 +818,7 @@ fdb_status fdb_snapshot_open(fdb_kvs_handle *handle_in,
     fdb_status fs;
     filemgr *file;
     file_status_t fstatus = FILE_NORMAL;
+    LATENCY_STAT_START();
 
     if (!handle_in || !ptr_handle) {
         return FDB_RESULT_INVALID_ARGS;
@@ -984,6 +986,7 @@ fdb_snapshot_open_start:
             }
         }
     }
+    LATENCY_STAT_END(handle->file, FDB_LATENCY_SNAPSHOTS);
     return fs;
 }
 
@@ -2217,6 +2220,7 @@ fdb_status fdb_get(fdb_kvs_handle *handle, fdb_doc *doc)
     hbtrie_result hr = HBTRIE_RESULT_FAIL;
     fdb_txn *txn;
     fdb_doc doc_kv = *doc;
+    LATENCY_STAT_START();
 
     if (!handle || !doc || !doc->key || doc->keylen == 0 ||
         doc->keylen > FDB_MAX_KEYLEN ||
@@ -2325,6 +2329,7 @@ fdb_status fdb_get(fdb_kvs_handle *handle, fdb_doc *doc)
         doc->offset = offset;
 
         fdb_assert(atomic_cas_uint8_t(&handle->handle_busy, 1, 0), 1, 0);
+        LATENCY_STAT_END(handle->file, FDB_LATENCY_GETS);
         return FDB_RESULT_SUCCESS;
     }
 
@@ -2344,6 +2349,7 @@ fdb_status fdb_get_metaonly(fdb_kvs_handle *handle, fdb_doc *doc)
     hbtrie_result hr = HBTRIE_RESULT_FAIL;
     fdb_txn *txn;
     fdb_doc doc_kv = *doc;
+    LATENCY_STAT_START();
 
     if (!handle || !doc || !doc->key ||
         doc->keylen == 0 || doc->keylen > FDB_MAX_KEYLEN ||
@@ -2445,6 +2451,7 @@ fdb_status fdb_get_metaonly(fdb_kvs_handle *handle, fdb_doc *doc)
         doc->offset = offset;
 
         fdb_assert(atomic_cas_uint8_t(&handle->handle_busy, 1, 0), 1, 0);
+        LATENCY_STAT_END(handle->file, FDB_LATENCY_GETS);
         return FDB_RESULT_SUCCESS;
     }
 
@@ -2464,6 +2471,7 @@ fdb_status fdb_get_byseq(fdb_kvs_handle *handle, fdb_doc *doc)
     btree_result br = BTREE_RESULT_FAIL;
     fdb_seqnum_t _seqnum;
     fdb_txn *txn;
+    LATENCY_STAT_START();
 
     if (!handle || !doc || doc->seqnum == SEQNUM_NOT_USED) {
         return FDB_RESULT_INVALID_ARGS;
@@ -2593,6 +2601,7 @@ fdb_status fdb_get_byseq(fdb_kvs_handle *handle, fdb_doc *doc)
         fdb_assert(doc->seqnum == _doc.seqnum, doc->seqnum, _doc.seqnum);
 
         fdb_assert(atomic_cas_uint8_t(&handle->handle_busy, 1, 0), 1, 0);
+        LATENCY_STAT_END(handle->file, FDB_LATENCY_GETS);
         return FDB_RESULT_SUCCESS;
     }
 
@@ -2860,6 +2869,7 @@ fdb_status fdb_set(fdb_kvs_handle *handle, fdb_doc *doc)
     file_status_t fstatus;
     fdb_txn *txn = handle->fhandle->root->txn;
     fdb_status wr = FDB_RESULT_SUCCESS;
+    LATENCY_STAT_START();
 
     if (handle->config.flags & FDB_OPEN_FLAG_RDONLY) {
         return fdb_log(&handle->log_callback, FDB_RESULT_RONLY_VIOLATION,
@@ -3062,6 +3072,8 @@ fdb_set_start:
     }
 
     filemgr_mutex_unlock(file);
+
+    LATENCY_STAT_END(file, FDB_LATENCY_SETS);
 
     if (!doc->deleted) {
         atomic_incr_uint64_t(&handle->op_stats->num_sets);
@@ -3300,6 +3312,7 @@ fdb_status _fdb_commit(fdb_kvs_handle *handle, fdb_commit_opt_t opt)
     bid_t dirty_idtree_root, dirty_seqtree_root;
     struct avl_tree flush_items;
     fdb_status wr = FDB_RESULT_SUCCESS;
+    LATENCY_STAT_START();
 
     if (handle->kvs) {
         if (handle->kvs->type == KVS_SUB) {
@@ -3448,6 +3461,7 @@ fdb_commit_start:
     handle->dirty_updates = 0;
     filemgr_mutex_unlock(handle->file);
 
+    LATENCY_STAT_END(handle->file, FDB_LATENCY_COMMITS);
     atomic_incr_uint64_t(&handle->op_stats->num_commits);
     return fs;
 }
@@ -3563,6 +3577,10 @@ static fdb_status _fdb_commit_and_remove_pending(fdb_kvs_handle *handle,
     // from this point onward all callers will re-open new_file
     handle->op_stats = filemgr_migrate_op_stats(old_file, new_file, handle->kvs);
     fdb_assert(handle->op_stats, 0, 0);
+#ifdef _LATENCY_STATS
+    // Migrate latency stats from old file to new file..
+    filemgr_migrate_latency_stats(old_file, new_file);
+#endif // _LATENCY_STATS
 
     // This mutex was acquired by the caller (i.e., _fdb_compact_file()).
     filemgr_mutex_unlock(old_file);
@@ -4885,6 +4903,7 @@ fdb_status fdb_compact_file(fdb_file_handle *fhandle,
     struct hbtrie *new_seqtrie = NULL;
     fdb_kvs_handle *handle = fhandle->root;
     fdb_status status;
+    LATENCY_STAT_START();
 
     // prevent update to the target file
     filemgr_mutex_lock(handle->file);
@@ -4973,8 +4992,10 @@ fdb_status fdb_compact_file(fdb_file_handle *fhandle,
         }
     }
 
-    return _fdb_compact_file(handle, new_file, new_bhandle, new_dhandle,
+    status = _fdb_compact_file(handle, new_file, new_bhandle, new_dhandle,
                              new_trie, new_seqtrie, new_seqtree, marker_bid);
+    LATENCY_STAT_END(fhandle->root->file, FDB_LATENCY_COMPACTS);
+    return status;
 }
 
 fdb_status _fdb_compact_file(fdb_kvs_handle *handle,
@@ -5256,6 +5277,7 @@ fdb_status fdb_compact(fdb_file_handle *fhandle,
                        const char *new_filename)
 {
     fdb_kvs_handle *handle = fhandle->root;
+    fdb_status fs = FDB_RESULT_SUCCESS;
 
     if (handle->config.compaction_mode == FDB_COMPACTION_MANUAL) {
         // manual compaction
@@ -5266,7 +5288,7 @@ fdb_status fdb_compact(fdb_file_handle *fhandle,
             compactor_get_next_filename(handle->file->filename, nextfile);
             new_filename = nextfile;
         }
-        return fdb_compact_file(fhandle, new_filename, in_place_compaction,
+        fs = fdb_compact_file(fhandle, new_filename, in_place_compaction,
                                 BLK_NOT_FOUND);
 
     } else { // auto compaction mode.
@@ -5285,8 +5307,8 @@ fdb_status fdb_compact(fdb_file_handle *fhandle,
         // clear compaction flag
         ret = compactor_switch_compaction_flag(handle->file, false);
         (void)ret;
-        return fs;
     }
+    return fs;
 }
 
 LIBFDB_API
@@ -5577,6 +5599,25 @@ fdb_status fdb_destroy(const char *fname,
     filemgr_mutex_openunlock();
 
     return status;
+}
+
+LIBFDB_API
+fdb_status fdb_get_latency_stats(fdb_file_handle *fhandle,
+                                 fdb_latency_stat *stat,
+                                 fdb_latency_stat_type type)
+{
+    struct filemgr *file;
+    if (!fhandle || !stat ||!fhandle->root || type >= FDB_LATENCY_NUM_STATS) {
+        return FDB_RESULT_INVALID_ARGS;
+    }
+    if (!fhandle->root->file) {
+        return FDB_RESULT_FILE_NOT_OPEN;
+    }
+    file = fhandle->root->file;
+#ifdef _LATENCY_STATS
+    filemgr_get_latency_stat(file, type, stat);
+#endif // _LATENCY_STATS
+    return FDB_RESULT_SUCCESS;
 }
 
 // roughly estimate the space occupied db handle HANDLE
