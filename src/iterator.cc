@@ -32,6 +32,7 @@
 #include "list.h"
 #include "internal_types.h"
 #include "btree_var_kv_ops.h"
+#include "timing.h"
 
 #include "memleak.h"
 
@@ -213,6 +214,7 @@ fdb_status fdb_iterator_init(fdb_kvs_handle *handle,
     struct wal_item_header *wal_item_header;
     struct wal_item *wal_item;
     struct snap_wal_entry *snap_item;
+    LATENCY_STAT_START();
 
     if (handle == NULL ||
         start_keylen > FDB_MAX_KEYLEN ||
@@ -456,6 +458,7 @@ fdb_status fdb_iterator_init(fdb_kvs_handle *handle,
 
     fdb_iterator_next(iterator); // position cursor at first key
 
+    LATENCY_STAT_END(iterator->handle->file, FDB_LATENCY_ITR_INIT);
     return FDB_RESULT_SUCCESS;
 }
 
@@ -667,6 +670,7 @@ static fdb_status _fdb_iterator_prev(fdb_iterator *iterator)
     hbtrie_result hr = HBTRIE_RESULT_SUCCESS;
     struct docio_handle *dhandle;
     struct snap_wal_entry *snap_item = NULL;
+    LATENCY_STAT_START();
 
     if (iterator->direction == FDB_ITR_FORWARD) {
         iterator->_offset = BLK_NOT_FOUND; // need to re-examine Trie/trees
@@ -810,6 +814,7 @@ start:
     iterator->_dhandle = dhandle; // store for fdb_iterator_get()
     iterator->_get_offset = offset; // store for fdb_iterator_get()
 
+    LATENCY_STAT_END(iterator->handle->file, FDB_LATENCY_ITR_PREV);
     return FDB_RESULT_SUCCESS;
 }
 
@@ -1907,6 +1912,7 @@ fdb_status fdb_iterator_prev(fdb_iterator *iterator)
 fdb_status fdb_iterator_next(fdb_iterator *iterator)
 {
     fdb_status result = FDB_RESULT_SUCCESS;
+    LATENCY_STAT_START();
 
     if (!atomic_cas_uint8_t(&iterator->handle->handle_busy, 0, 1)) {
         return FDB_RESULT_HANDLE_BUSY;
@@ -1944,6 +1950,7 @@ fdb_status fdb_iterator_next(fdb_iterator *iterator)
 
     fdb_assert(atomic_cas_uint8_t(&iterator->handle->handle_busy, 1, 0), 1, 0);
     atomic_incr_uint64_t(&iterator->handle->op_stats->num_iterator_moves);
+    LATENCY_STAT_END(iterator->handle->file, FDB_LATENCY_ITR_NEXT);
     return result;
 }
 
@@ -2138,6 +2145,7 @@ fdb_status fdb_iterator_close(fdb_iterator *iterator)
 {
     struct avl_node *a;
     struct snap_wal_entry *snap_item;
+    LATENCY_STAT_START();
 
     if (iterator->hbtrie_iterator) {
         hbtrie_iterator_free(iterator->hbtrie_iterator);
@@ -2188,6 +2196,7 @@ fdb_status fdb_iterator_close(fdb_iterator *iterator)
         free(iterator->end_key);
     }
 
+    LATENCY_STAT_END(iterator->handle->file, FDB_LATENCY_ITR_CLOSE);
     if (!iterator->handle->shandle) {
         // Close the opened handle in the iterator,
         // if the handle is not for snapshot.
