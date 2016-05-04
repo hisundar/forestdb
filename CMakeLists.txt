@@ -53,6 +53,9 @@ if (NOT WIN32)
     set(PTHREAD_LIB pthread)
     set(LIBM m)
     set(FORESTDB_FILE_OPS "src/filemgr_ops_linux.cc")
+    if (NOT APPLE)
+        set(LIBRT rt)
+    endif (NOT APPLE)
 else (NOT WIN32)
     set(FORESTDB_FILE_OPS "src/filemgr_ops_windows.cc")
     set(GETTIMEOFDAY_VS "${PROJECT_SOURCE_DIR}/utils/gettimeofday_vs.cc")
@@ -134,7 +137,7 @@ add_library(forestdb SHARED
             utils/timing.cc
             utils/system_resource_stats.cc)
 target_link_libraries(forestdb ${PTHREAD_LIB} ${LIBM} ${SNAPPY_LIBRARIES}
-                      ${ASYNC_IO_LIB} ${MALLOC_LIBRARIES})
+                      ${ASYNC_IO_LIB} ${MALLOC_LIBRARIES} ${LIBRT})
 
 add_executable(forestdb_dump
                tools/dump_common.cc
@@ -175,7 +178,7 @@ add_executable(forestdb_dump
                utils/timing.cc
                utils/system_resource_stats.cc)
 target_link_libraries(forestdb_dump ${PTHREAD_LIB} ${LIBM} ${SNAPPY_LIBRARIES}
-                      ${ASYNC_IO_LIB} ${MALLOC_LIBRARIES})
+                      ${ASYNC_IO_LIB} ${MALLOC_LIBRARIES} ${LIBRT})
 set_target_properties(forestdb_dump PROPERTIES COMPILE_FLAGS "-D_FDB_TOOLS")
 
 add_executable(forestdb_hexamine
@@ -217,7 +220,7 @@ add_executable(forestdb_hexamine
                utils/timing.cc
                utils/system_resource_stats.cc)
 target_link_libraries(forestdb_hexamine ${PTHREAD_LIB} ${LIBM} ${SNAPPY_LIBRARIES}
-                      ${ASYNC_IO_LIB} ${MALLOC_LIBRARIES})
+                      ${ASYNC_IO_LIB} ${MALLOC_LIBRARIES} ${LIBRT})
 set_target_properties(forestdb_hexamine PROPERTIES COMPILE_FLAGS "-D_FDB_TOOLS")
 
 if ((NOT COUCHBASE_SERVER_BUILD) OR (INSTALL_HEADER_FILES))

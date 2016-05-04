@@ -986,7 +986,7 @@ fdb_snapshot_open_start:
             }
         }
     }
-    LATENCY_STAT_END(handle->file, FDB_LATENCY_SNAPSHOTS);
+    LATENCY_STAT_END(file, FDB_LATENCY_SNAPSHOTS);
     return fs;
 }
 
@@ -5606,18 +5606,22 @@ fdb_status fdb_get_latency_stats(fdb_file_handle *fhandle,
                                  fdb_latency_stat *stat,
                                  fdb_latency_stat_type type)
 {
-    struct filemgr *file;
     if (!fhandle || !stat ||!fhandle->root || type >= FDB_LATENCY_NUM_STATS) {
         return FDB_RESULT_INVALID_ARGS;
     }
     if (!fhandle->root->file) {
         return FDB_RESULT_FILE_NOT_OPEN;
     }
-    file = fhandle->root->file;
 #ifdef _LATENCY_STATS
-    filemgr_get_latency_stat(file, type, stat);
+    filemgr_get_latency_stat(fhandle->root->file, type, stat);
 #endif // _LATENCY_STATS
     return FDB_RESULT_SUCCESS;
+}
+
+LIBFDB_API
+const char *fdb_latency_stat_name(fdb_latency_stat_type type)
+{
+    return filemgr_latency_stat_name(type);
 }
 
 // roughly estimate the space occupied db handle HANDLE

@@ -306,6 +306,12 @@ void filemgr_set_compaction_state(struct filemgr *old_file,
                                   file_status_t status);
 void filemgr_remove_pending(struct filemgr *old_file, struct filemgr *new_file);
 
+/**
+ * Return name of the latency stat given its type.
+ * @param stat The type of the latency stat to be named.
+ */
+const char *filemgr_latency_stat_name(fdb_latency_stat_type stat);
+
 #ifdef _LATENCY_STATS
 /**
  * Initialize a latency stats instance
