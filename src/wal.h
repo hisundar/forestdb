@@ -150,6 +150,12 @@ struct wal_kvs_snaps {
 #define WAL_ITEM_FLUSH_READY (0x02)
 #define WAL_ITEM_MULTI_KV_INS_MODE (0x04)
 #define WAL_ITEM_FLUSHED_OUT (0x08)
+// not all wal_items are indexed into their KV Store's snapshot handles
+// (for example uncommitted transactional items)
+// this flag is only set in those items which are inserted into their snapshot
+// It is used during updates when one item is replaced with another
+#define WAL_ITEM_IN_SNAP_TREE (0x10)
+
 struct wal_item{
     struct list_elem list_elem; // for wal_item_header's 'items'
     struct avl_node avl_seq; // used for indexing by sequence number
@@ -167,8 +173,9 @@ struct wal_item{
         struct list_elem list_elem_txn; // for transaction
         struct avl_node avl_flush;
         struct list_elem list_elem_flush;
-        struct avl_node avl_keysnap; // for durable snapshot unique key lookup
     };
+    struct avl_node avl_keysnap; // for durable snapshot unique key lookup
+    struct avl_node avl_seqsnap; // for durable snapshot unique seqnum lookup
 };
 
 typedef fdb_status wal_flush_func(void *dbhandle, struct wal_item *item,
@@ -249,10 +256,11 @@ struct wal_iterator {
     bool by_key; // if not set means iteration is by sequence number range
     bool multi_kvs; // single kv mode vs multi kv instance mode
     uint8_t direction; // forward/backward/none to avoid grabbing all locks
-    struct avl_tree merge_tree; // AVL tree to perform merge-sort over cursors
-    struct avl_node *cursor_pos; // points to shard that returns current item
-    struct wal_item *item_prev; // points to previous iterator item returned
-    struct wal_cursor *cursors; // cursor to item from each shard's tree
+    size_t numCursors; // number of shared kvs snapshots from the global WAL
+    struct avl_tree mergeTree; // AVL tree to perform merge-sort over mergeCursors
+    struct wal_cursor *mergeCursors; // cursor to item from each snapshot's tree
+    struct avl_node *cursorPos; // points to snapshot that returns current item
+    struct wal_item *prevItem; // points to previous iterator item returned
 };
 
 struct wal_txn_wrapper {
