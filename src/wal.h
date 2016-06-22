@@ -78,7 +78,7 @@ struct snap_handle {
      * Incremented on snapshot_open, decremented on snapshot_close(Write Barrier)
      * Reference count to avoid copy if same KV store WAL snapshot is cloned.
      */
-    atomic_uint16_t ref_cnt_kvs;
+    atomic_uint64_t ref_cnt_kvs;
     /**
      * Did wal_flush make me inaccessible to later snapshots, (Read-Write Barrier)
      */
@@ -87,6 +87,10 @@ struct snap_handle {
      * Is this a persistent snapshot completely separate from WAL.
      */
     bool is_persisted_snapshot;
+    /**
+     * Number of previous snapshots which share items with current snapshot.
+     */
+    int num_prev_snaps;
     /**
      * Number of WAL items put into this snapshot before it became immutable.
      */

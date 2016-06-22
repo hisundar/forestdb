@@ -8265,8 +8265,8 @@ void _fdb_dump_handle(fdb_kvs_handle *h) {
 
     fprintf(stderr, "snap_handle: %p\n", (void *)h->shandle);
     if (h->shandle) {
-        fprintf(stderr, "shandle: ref_cnt %d\n",
-                atomic_get_uint16_t(&h->shandle->ref_cnt_kvs));
+        fprintf(stderr, "shandle: ref_cnt %" _F64 "\n",
+                atomic_get_uint64_t(&h->shandle->ref_cnt_kvs));
         fprintf(stderr, "shandle: kvs_stat: nlivenodes %" _F64 "\n",
                h->shandle->stat.nlivenodes);
         fprintf(stderr, "shandle: kvs_stat: ndocs %" _F64 "\n",
