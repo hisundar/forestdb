@@ -259,10 +259,12 @@ INLINE struct snap_handle * _wal_get_latest_snapshot(struct wal_kvs_snaps *kv_sn
     return shandle;
 }
 
-INLINE struct snap_handle *_wal_snapshot_create(fdb_kvs_id_t kv_id,
-                                                wal_snapid_t snap_tag,
-                                                wal_snapid_t snap_flush_tag,
-                                                struct wal_kvs_snaps *kvs_snapshots)
+INLINE
+struct snap_handle *_wal_snapshot_create(fdb_kvs_id_t kv_id,
+                                         wal_snapid_t snap_tag,
+                                         wal_snapid_t snap_flush_tag,
+                                         _fdb_key_cmp_info *key_cmp_info,
+                                         struct wal_kvs_snaps *kvs_snapshots)
 {
    struct snap_handle *shandle = (struct snap_handle *)
                                    calloc(1, sizeof(struct snap_handle));
@@ -270,8 +272,11 @@ INLINE struct snap_handle *_wal_snapshot_create(fdb_kvs_id_t kv_id,
        shandle->id = kv_id;
        shandle->snap_tag_idx = snap_tag;
        shandle->snap_stop_idx = snap_flush_tag;
-       atomic_init_uint16_t(&shandle->ref_cnt_kvs, 0);
+       atomic_init_uint64_t(&shandle->ref_cnt_kvs, 0);
        atomic_init_uint64_t(&shandle->wal_ndocs, 0);
+       shandle->cmp_info = *key_cmp_info; // (key_cmp_info may be stack memory)
+       avl_init(&shandle->key_tree, &shandle->cmp_info);
+       avl_init(&shandle->seq_tree, NULL);
        shandle->kvs_snapshots = kvs_snapshots;
        return shandle;
    }
@@ -281,7 +286,7 @@ INLINE struct snap_handle *_wal_snapshot_create(fdb_kvs_id_t kv_id,
 // When a snapshot reader has called wal_snapshot_open(), the ref count
 // on the snapshot handle will be incremented
 INLINE bool _wal_snap_is_immutable(struct snap_handle *shandle) {
-    return atomic_get_uint16_t(&shandle->ref_cnt_kvs);
+    return atomic_get_uint64_t(&shandle->ref_cnt_kvs);
 }
 
 /**
@@ -291,7 +296,8 @@ INLINE bool _wal_snap_is_immutable(struct snap_handle *shandle) {
  * If the highest snapshot was made un-readable by wal_flush (Read barrier)
  */
 INLINE struct snap_handle * _wal_fetch_snapshot(struct wal *_wal,
-                                                fdb_kvs_id_t kv_id)
+                                                fdb_kvs_id_t kv_id,
+                                                _fdb_key_cmp_info *key_cmp_info)
 {
     struct wal_kvs_snaps *kvs_snapshots;
     struct snap_handle *open_snapshot;
@@ -329,7 +335,7 @@ INLINE struct snap_handle * _wal_fetch_snapshot(struct wal *_wal,
             }
         }
         open_snapshot = _wal_snapshot_create(kv_id, snap_id, snap_flush_id,
-                                             kvs_snapshots);
+                                             key_cmp_info, kvs_snapshots);
         list_push_back(&kvs_snapshots->snap_list, &open_snapshot->snaplist_elem);
         kvs_snapshots->num_snaps++;
     }
@@ -343,13 +349,11 @@ INLINE struct snap_handle * _wal_fetch_snapshot(struct wal *_wal,
 INLINE fdb_status _wal_snapshot_init(struct snap_handle *shandle,
                                      filemgr *file,
                                      fdb_txn *txn,
-                                     fdb_seqnum_t seqnum,
-                                     _fdb_key_cmp_info *key_cmp_info)
+                                     fdb_seqnum_t seqnum)
 {
     struct list_elem *ee;
     shandle->snap_txn = txn;
-    shandle->cmp_info = *key_cmp_info;
-    atomic_incr_uint16_t(&shandle->ref_cnt_kvs);
+    atomic_incr_uint64_t(&shandle->ref_cnt_kvs);
     _kvs_stat_get(file, shandle->id, &shandle->stat);
     if (seqnum == FDB_SNAPSHOT_INMEM) {
         shandle->seqnum = fdb_kvs_get_seqnum(file, shandle->id);
@@ -360,8 +364,6 @@ INLINE fdb_status _wal_snapshot_init(struct snap_handle *shandle,
         shandle->seqnum = seqnum;
         shandle->is_persisted_snapshot = true;
     }
-    avl_init(&shandle->key_tree, &shandle->cmp_info);
-    avl_init(&shandle->seq_tree, NULL);
     shandle->global_txn = &file->global_txn;
     list_init(&shandle->active_txn_list);
     ee = list_begin(&file->wal->txn_list);
@@ -407,86 +409,51 @@ fdb_status wal_snapshot_open(struct filemgr *file,
         // This can happen when a new snapshot is attempted and WAL was flushed
         // and no mutations after WAL flush - the snapshot exists solely for
         // existing open snapshot iterators
-        _shandle = _wal_snapshot_create(kv_id, 0, 0, kvs_snapshots);
+        _shandle = _wal_snapshot_create(kv_id, 0, 0, key_cmp_info, kvs_snapshots);
         if (!_shandle) { // LCOV_EXCL_START
             spin_unlock(&_wal->lock);
             return FDB_RESULT_ALLOC_FAIL;
         } // LCOV_EXCL_STOP
         // This snapshot is not inserted into global shared tree
-        _wal_snapshot_init(_shandle, file, txn, seqnum, key_cmp_info);
+        _wal_snapshot_init(_shandle, file, txn, seqnum);
         DBG("%s Persisted snapshot taken at %" _F64 " for kv id %" _F64 "\n",
             file->filename, _shandle->seqnum, kv_id);
     } else { // Take a snapshot of the latest WAL state for this KV Store
+        // Bump up ref count on all past snapshots to prevent deletion!
+        int num_prev_snaps = 0;
+        struct list_elem *e = list_prev(&_shandle->snaplist_elem);
+        while (e) {
+            struct snap_handle *__shandle = _get_entry(e,
+                    struct snap_handle, snaplist_elem);
+            if (__shandle->snap_tag_idx <= _shandle->snap_stop_idx) {
+                    break;
+            }
+            __shandle->ref_cnt_kvs++;
+            num_prev_snaps++;
+            e = list_prev(e);
+        }
         if (_wal_snap_is_immutable(_shandle)) { // existing snapshot still open
-            atomic_incr_uint16_t(&_shandle->ref_cnt_kvs); // ..just Clone it
-        } else { // make this snapshot of the WAL immutable..
-            _wal_snapshot_init(_shandle, file, txn, seqnum, key_cmp_info);
-            DBG("%s Snapshot init %" _F64 " - %" _F64 " taken at %"
-                _F64 " for kv id %" _F64 "\n",
+            atomic_incr_uint64_t(&_shandle->ref_cnt_kvs); // ..just Clone it
+            DBG("%s Snapshot Clone %" _F64 " - %" _F64 " taken at %"
+                _F64 " for kv id %" _F64 " Prev Snapshots =%d\n",
                 file->filename, _shandle->snap_stop_idx,
-                _shandle->snap_tag_idx, _shandle->seqnum, kv_id);
+                _shandle->snap_tag_idx, _shandle->seqnum, kv_id,
+                _shandle->num_prev_snaps);
+            fdb_assert(_shandle->num_prev_snaps == num_prev_snaps,
+                       _shandle->num_prev_snaps, num_prev_snaps);
+        } else { // make this snapshot of the WAL immutable..
+            _shandle->num_prev_snaps = num_prev_snaps;
+            _wal_snapshot_init(_shandle, file, txn, seqnum);
+            DBG("%s New Snapshot %" _F64 " - %" _F64 " taken at %"
+                _F64 " for kv id %" _F64 " prev_snaps=%d\n",
+                file->filename, _shandle->snap_stop_idx,
+                _shandle->snap_tag_idx, _shandle->seqnum, kv_id,
+                _shandle->num_prev_snaps);
         }
     }
     spin_unlock(&_wal->lock);
     *shandle = _shandle;
     return FDB_RESULT_SUCCESS;
-}
-
-
-INLINE bool _wal_can_discard(struct wal *_wal,
-                             struct wal_item *_item,
-                             struct wal_item *covering_item)
-{
-#ifndef _MVCC_WAL_ENABLE
-    return true; // if WAL is never shared, this can never be false
-#endif // _MVCC_WAL_ENABLE
-    struct snap_handle *shandle, *snext;
-    wal_snapid_t snap_stop_idx;
-    wal_snapid_t snap_tag_idx;
-    fdb_kvs_id_t kv_id;
-    bool ret = true;
-
-    if (covering_item) { // stop until the covering item's snapshot is found
-        snap_stop_idx = covering_item->shandle->snap_tag_idx;
-    } else {
-        snap_stop_idx = OPEN_SNAPSHOT_TAG;
-    }
-
-    shandle = _item->shandle;
-    fdb_assert(shandle, _item->seqnum, covering_item);
-
-    snap_tag_idx = shandle->snap_tag_idx;
-    kv_id = shandle->id;
-
-    if (_wal_snap_is_immutable(shandle)) {// its active snapshot is still open
-        ret = false; // it cannot be discarded
-    } else { // item's own snapshot is closed, but a later snapshot may need it
-        struct list_elem *e;
-        spin_lock(&_wal->lock);
-        e = list_next(&shandle->snaplist_elem);
-        while (e) { // check snapshots taken later until its wal was flushed
-            snext = _get_entry(e, struct snap_handle, snaplist_elem);
-            if (snext->id != kv_id) { // don't look beyond current kv store
-                break;
-            }
-
-            if (snext->snap_stop_idx > snap_tag_idx) { // wal was flushed here.
-                break; // From this snapshot onwards, this item is reflected..
-            } // ..in the main index
-
-            if (snext->snap_tag_idx == snap_stop_idx) {
-                break; // we reached the covering item, need not examine further
-            }
-
-            if (_wal_snap_is_immutable(snext)) {
-                ret = false; // a future snapshot needs this item!
-                break;
-            }
-            e = list_next(e);
-        }
-        spin_unlock(&_wal->lock);
-    }
-    return ret;
 }
 
 typedef enum _wal_update_type_t {
@@ -546,7 +513,7 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
     } else {
         kv_id = 0;
     }
-    shandle = _wal_fetch_snapshot(file->wal, kv_id);
+    shandle = _wal_fetch_snapshot(file->wal, kv_id, cmp_info);
     snap_tag = shandle->snap_tag_idx;
     query.key = key;
     query.keylen = keylen;
@@ -1101,14 +1068,19 @@ fdb_status wal_find_kv_id(fdb_txn *txn,
 
 // Pre-condition: writer lock (filemgr mutex) must be held for this call
 // Readers can interleave without lock
-INLINE void _wal_free_item(struct wal_item *item, struct wal *_wal) {
+INLINE void _wal_free_item(struct wal_item *item, struct wal *_wal,
+                           bool gotlock) {
     struct snap_handle *shandle = item->shandle;
     if (!atomic_decr_uint64_t(&shandle->wal_ndocs)) {
-        spin_lock(&_wal->lock);
+        if (!gotlock) {
+            spin_lock(&_wal->lock);
+        }
         DBG("%s Last item removed from snapshot %" _F64 "-%" _F64 " %" _F64
                 " kv id %" _F64 ". Destroy snapshot handle..\n",
                 shandle->snap_txn && shandle->snap_txn->handle ?
                 shandle->snap_txn->handle->file->filename : "",
+        fdb_assert(!_wal_snap_is_immutable(shandle), shandle->snap_tag_idx,
+                   shandle->snap_stop_idx);
                 shandle->snap_stop_idx, shandle->snap_tag_idx,
                 shandle->seqnum, shandle->id);
         list_remove(&shandle->kvs_snapshots->snap_list, &shandle->snaplist_elem);
@@ -1121,7 +1093,9 @@ INLINE void _wal_free_item(struct wal_item *item, struct wal *_wal) {
             e = e_next;
         }
         free(shandle);
-        spin_unlock(&_wal->lock);
+        if (!gotlock) {
+            spin_unlock(&_wal->lock);
+        }
     }
 #ifdef __DEBUG_WAL
     memset(item, 0, sizeof(struct wal_item));
@@ -1327,10 +1301,12 @@ fdb_status wal_commit(fdb_txn *txn, struct filemgr *file,
                     break;
                 }
                 e2 = list_prev(e2);
+                spin_lock(&file->wal->lock); // guard global snaplist from snapshot_open
                 can_overwrite = (item->shandle == _item->shandle ||
-                                 _wal_can_discard(file->wal, _item, item));
+                                 !_wal_snap_is_immutable(_item->shandle));
                 if (!can_overwrite) {
                     item = _item; // new covering item found
+                    spin_unlock(&file->wal->lock);
                     continue;
                 }
                 // committed but not flush-ready
@@ -1370,7 +1346,7 @@ fdb_status wal_commit(fdb_txn *txn, struct filemgr *file,
                         _wal_update_stat(file, kv_id, _WAL_DROP_DELETE);
                     }
                     mem_overhead += sizeof(struct wal_item);
-                    _wal_free_item(_item, file->wal);
+                    _wal_free_item(_item, file->wal, true);
                 } else {
                     fdb_log(log_callback, status,
                             "Wal commit called when wal_flush in progress."
@@ -1380,6 +1356,7 @@ fdb_status wal_commit(fdb_txn *txn, struct filemgr *file,
                             atomic_get_uint8_t(&_item->flag),
                             _item->action, file->filename);
                 }
+                spin_unlock(&file->wal->lock);
             }
         }
 
@@ -1452,7 +1429,7 @@ INLINE void _wal_release_item(struct filemgr *file, size_t shard_num,
         atomic_sub_uint64_t(&file->wal->datasize, item->doc_size,
                             std::memory_order_relaxed);
     }
-    _wal_free_item(item, file->wal);
+    _wal_free_item(item, file->wal, false);
 }
 
 INLINE list_elem *_wal_release_items(struct filemgr *file, size_t shard_num,
@@ -1469,7 +1446,7 @@ INLINE list_elem *_wal_release_items(struct filemgr *file, size_t shard_num,
         kv_id = 0;
     }
     le = list_prev(le);
-    if (_wal_can_discard(file->wal, item, NULL)) {
+    if (!_wal_snap_is_immutable(item->shandle)) {
         _wal_release_item(file, shard_num, kv_id, item);
         mem_overhead += sizeof(struct wal_item);
         item = NULL;
@@ -1485,7 +1462,7 @@ INLINE list_elem *_wal_release_items(struct filemgr *file, size_t shard_num,
             break;
         }
         le = list_prev(le);
-        if (_wal_can_discard(file->wal, sitem, item)) {
+        if (!_wal_snap_is_immutable(sitem->shandle)) {
             _wal_release_item(file, shard_num, kv_id, sitem);
             mem_overhead += sizeof(struct wal_item);
         } else {
@@ -1830,7 +1807,17 @@ fdb_status wal_snapshot_clone(struct snap_handle *shandle_in,
 {
     if (seqnum == FDB_SNAPSHOT_INMEM ||
         shandle_in->seqnum == seqnum) {
-        atomic_incr_uint16_t(&shandle_in->ref_cnt_kvs);
+        // Bump up ref count on all shared snapshots to prevent deletion!
+        struct snap_handle *shandle = shandle_in;
+        for (int i = 0;; ++i) {
+            atomic_incr_uint64_t(&shandle->ref_cnt_kvs);
+            if (i < shandle_in->num_prev_snaps) {
+                struct list_elem *snap_elem = list_prev(&shandle->snaplist_elem);
+                shandle = _get_entry(snap_elem, struct snap_handle, snaplist_elem);
+            } else {
+                break;
+            }
+        }
         *shandle_out = shandle_in;
         return FDB_RESULT_SUCCESS;
     }
@@ -1856,12 +1843,12 @@ fdb_status wal_dur_snapshot_open(fdb_seqnum_t seqnum,
     } else {
         kv_id = key_cmp_info->kvs->id;
     }
-    _shandle = _wal_snapshot_create(kv_id, 0, 0, NULL);
+    _shandle = _wal_snapshot_create(kv_id, 0, 0, key_cmp_info, NULL);
     if (!_shandle) { // LCOV_EXCL_START
         return FDB_RESULT_ALLOC_FAIL;
     } // LCOV_EXCL_STOP
     spin_lock(&file->wal->lock);
-    _wal_snapshot_init(_shandle, file, txn, seqnum, key_cmp_info);
+    _wal_snapshot_init(_shandle, file, txn, seqnum);
     spin_unlock(&file->wal->lock);
     *shandle = _shandle;
     return FDB_RESULT_SUCCESS;
@@ -2064,34 +2051,59 @@ fdb_status _wal_snap_find(struct snap_handle *shandle, fdb_doc *doc,
     return FDB_RESULT_KEY_NOT_FOUND;
 }
 
-fdb_status wal_snapshot_close(struct snap_handle *shandle,
-                              struct filemgr *file)
-{
-    if (!atomic_decr_uint16_t(&shandle->ref_cnt_kvs)) {
-        struct avl_node *a, *nexta;
-        if (!shandle->is_persisted_snapshot &&
-            shandle->snap_tag_idx) { // the KVS did have items in WAL..
-            return FDB_RESULT_SUCCESS;
-        }
-        for (a = avl_first(&shandle->key_tree);
-             a; a = nexta) {
-            struct wal_item *item = _get_entry(a, struct wal_item, avl_keysnap);
-            nexta = avl_next(a);
-            avl_remove(&shandle->key_tree, &item->avl_keysnap);
-            free(item->header->key);
-            free(item->header);
-            free(item);
-        }
-        for (struct list_elem *e = list_begin(&shandle->active_txn_list); e;) {
-            struct list_elem *e_next = list_next(e);
-            struct wal_txn_wrapper *active_txn = _get_entry(e,
-                                                   struct wal_txn_wrapper, le);
-            free(active_txn);
-            e = e_next;
-        }
-        free(shandle);
+void _wal_snapshot_close(struct snap_handle *shandle) {
+    struct avl_node *a, *nexta;
+    for (a = avl_first(&shandle->key_tree); a; a = nexta) {
+        struct wal_item *item = _get_entry(a, struct wal_item, avl_keysnap);
+        nexta = avl_next(a);
+        avl_remove(&shandle->key_tree, &item->avl_keysnap);
+        free(item->header->key);
+        free(item->header);
+        free(item);
     }
-    return FDB_RESULT_SUCCESS;
+    for (struct list_elem *e = list_begin(&shandle->active_txn_list); e;) {
+        struct list_elem *e_next = list_next(e);
+        struct wal_txn_wrapper *active_txn = _get_entry(e,
+                                            struct wal_txn_wrapper, le);
+        free(active_txn);
+        e = e_next;
+    }
+    free(shandle);
+}
+
+fdb_status wal_snapshot_close(struct snap_handle *shandle, struct filemgr *file)
+{
+    fdb_status fs = FDB_RESULT_SUCCESS;
+    if (!shandle->is_persisted_snapshot &&
+        shandle->snap_tag_idx) { // the KVS did have items in WAL..
+        struct snap_handle *_shandle = shandle;
+        DBG("%s Close InMem Snapshot %" _F64 " - %" _F64 " taken at %"
+                _F64 " for kv id %" _F64 " prev_snaps=%d\n",
+                file->filename, _shandle->snap_stop_idx,
+                _shandle->snap_tag_idx, _shandle->seqnum,
+                _shandle->kvs_snapshots->id,
+                _shandle->num_prev_snaps);
+        // Decrement ref counts on all the previous shared snapshots..
+        int num_prev_snaps = shandle->num_prev_snaps;
+        struct list_elem *snap_elem = &_shandle->snaplist_elem;
+        for (int i = 0;; ++i) {
+            if (i < num_prev_snaps) {
+                snap_elem = list_prev(&_shandle->snaplist_elem);
+                _shandle->ref_cnt_kvs--;
+                _shandle = _get_entry(snap_elem, struct snap_handle, snaplist_elem);
+            } else {
+                _shandle = _get_entry(snap_elem, struct snap_handle, snaplist_elem);
+                fdb_assert(_shandle->ref_cnt_kvs, _shandle->ref_cnt_kvs, 1);
+                _shandle->ref_cnt_kvs--;
+                break;
+            }
+        }
+        return fs;
+    } // ELSE persisted or un-shared snapshot ...
+    if (!(--shandle->ref_cnt_kvs)) {
+        _wal_snapshot_close(shandle);
+    }
+    return fs;
 }
 
 fdb_status wal_itr_init(struct filemgr *file,
@@ -2927,8 +2939,14 @@ static fdb_status _wal_close(struct filemgr *file,
                 shandle = _get_entry(snap_elem, struct snap_handle, snaplist_elem);
                 if (_wal_snap_is_immutable(shandle)) {
                     fdb_log(log_callback, FDB_RESULT_INVALID_ARGS,
-                            "WAL closed before snapshot close in kv id %" _F64
-                            " in file %s", kvs_snapshots->id, file->filename);
+                            "Unclosed Snapshot in KVS id %" _F64
+                            " with %" _F64 " docs in file %s."
+                            "Snap id=%" _F64 " SnapSTOP=%" _F64 " "
+                            "refcnt=%d", shandle->kvs_snapshots->id,
+                            atomic_get_uint64_t(&shandle->wal_ndocs),
+                            file->filename,
+                            shandle->snap_tag_idx, shandle->snap_stop_idx,
+                            atomic_get_uint64_t(&shandle->ref_cnt_kvs));
                 }
                 for (struct list_elem *ee = list_begin(&shandle->active_txn_list);
                         ee;) {
