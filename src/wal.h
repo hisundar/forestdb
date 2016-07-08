@@ -133,7 +133,10 @@ struct wal_item{
     struct list_elem list_elem; // for wal_item_header's 'items'
     struct avl_node avl_seq; // used for indexing by sequence number
     struct wal_item_header *header;
-    fdb_txn *txn;
+    union {
+        fdb_txn *txn; // when transaction is uncommitted
+        uint64_t txn_id; // ONLY when transaction has committed
+    };
     struct snap_handle *shandle; // Pointer into wal_snapshot_tree for KV Store
     wal_item_action action;
     atomic_uint8_t flag;

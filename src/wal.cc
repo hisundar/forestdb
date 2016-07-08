@@ -554,9 +554,10 @@ INLINE fdb_status _wal_insert(fdb_txn *txn,
         while (le) {
             item = _get_entry(le, struct wal_item, list_elem);
 
-            if (item->txn == txn && !(item->flag & WAL_ITEM_COMMITTED ||
-                caller == WAL_INS_COMPACT_PHASE1) &&
-                item->shandle->snap_tag_idx == snap_tag) {
+            if (!(item->flag & WAL_ITEM_COMMITTED ||
+                caller == WAL_INS_COMPACT_PHASE1) && // !committed & !compactor
+                item->txn == txn && // uncommitted item of same transaction
+                item->shandle->snap_tag_idx == snap_tag) { // same snapshot
                 item->flag &= ~WAL_ITEM_FLUSH_READY;
 
                 if (file->config->seqtree_opt == FDB_SEQTREE_USE) {
@@ -825,12 +826,13 @@ INLINE bool _wal_item_partially_committed(fdb_txn *global_txn,
     bool partial_commit = false;
 
     if (item->flag & WAL_ITEM_COMMITTED &&
-        item->txn != global_txn && item->txn != current_txn) {
+        item->txn_id != global_txn->txn_id &&
+        item->txn_id != current_txn->txn_id) {
         struct wal_txn_wrapper *txn_wrapper;
         struct list_elem *txn_elem = list_begin(active_txn_list);
         while(txn_elem) {
             txn_wrapper = _get_entry(txn_elem, struct wal_txn_wrapper, le);
-            if (txn_wrapper->txn == item->txn) {
+            if (txn_wrapper->txn->txn_id == item->txn_id) {
                 partial_commit = true;
                 break;
             }
@@ -867,7 +869,8 @@ INLINE struct wal_item *_wal_get_snap_item(struct wal_item_header *header,
 
     for (; le; le = list_next(le)) {
         item = _get_entry(le, struct wal_item, list_elem);
-        if (item->txn != txn && !(item->flag & WAL_ITEM_COMMITTED)) {
+        //item->txn is used instead of item->txn_id ONLY for uncommitted items
+        if (!(item->flag & WAL_ITEM_COMMITTED) && item->txn != txn) {
             continue;
         }
         if (item->shandle->snap_tag_idx > tag) {
@@ -1276,6 +1279,10 @@ fdb_status wal_commit(fdb_txn *txn, struct filemgr *file,
                     _wal_update_stat(file, kv_id, _WAL_NEW_DEL);
                 }
             }
+            // global_txn will always have id of 0 and all other transactions
+            // will have a non-zero transaction id
+            item->txn_id = txn->txn_id;
+
             // append commit mark if necessary
             if (func) {
                 status = func(txn->handle, item->offset);
@@ -1938,6 +1945,10 @@ fdb_status wal_copyto_snapshot(struct filemgr *file,
                 if (_wal_item_partially_committed(shandle->global_txn,
                                                   &shandle->active_txn_list,
                                                   shandle->snap_txn, item)) {
+                    ee = list_next(ee);
+                    continue;
+                }
+                if (item->seqnum > shandle->seqnum) {
                     ee = list_next(ee);
                     continue;
                 }
@@ -2820,8 +2831,10 @@ fdb_status wal_discard(struct filemgr *file, fdb_txn *txn)
         }
         // remove from txn's list
         e = list_remove(txn->items, e);
-        if (item->txn == &file->global_txn ||
-            item->flag & WAL_ITEM_COMMITTED) {
+        if ((!(item->flag & WAL_ITEM_COMMITTED) &&
+                item->txn == &file->global_txn)
+          || ((item->flag & WAL_ITEM_COMMITTED) &&
+               item->txn_id == file->global_txn.txn_id)) {
             atomic_decr_uint32_t(&file->wal->num_flushable);
         }
         if (item->action != WAL_ACT_REMOVE) {
@@ -2977,7 +2990,8 @@ static fdb_status _wal_close(struct filemgr *file,
                         atomic_sub_uint64_t(&file->wal->datasize, item->doc_size,
                                             std::memory_order_relaxed);
                     }
-                    if (item->txn == &file->global_txn || committed) {
+                    if ((!committed && item->txn == &file->global_txn)
+                        || committed) {
                         if (item->action != WAL_ACT_INSERT) {
                             _wal_update_stat(file, kv_id, _WAL_DROP_DELETE);
                         } else {
