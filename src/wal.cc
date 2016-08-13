@@ -182,6 +182,7 @@ fdb_status wal_init(struct filemgr *file, int nbucket)
     atomic_init_uint32_t(&file->wal->num_flushable, 0);
     atomic_init_uint64_t(&file->wal->datasize, 0);
     atomic_init_uint64_t(&file->wal->mem_overhead, 0);
+    atomic_init_uint8_t(&file->wal->unFlushedTransactions, 0);
     file->wal->wal_dirty = FDB_WAL_CLEAN;
 
     list_init(&file->wal->txn_list);
@@ -413,6 +414,61 @@ fdb_status wal_snapshot_open(struct filemgr *file,
     struct wal *_wal = file->wal;
     struct wal_kvs_snaps *kvs_snapshots;
     struct snap_handle *_shandle;
+
+    // Forestdb supports 2 transaction isolation levels. For simplicity,
+    // mutations from uncommitted transactions are not inserted into any
+    // global shared snapshots.
+    // As a result when snapshots are taken from within transactions, we
+    // have to copy all mutations differently based on the isolation levels
+    //  Example database with only 1 key - "keyA":
+    //  1) SET keyA (non-transactional)
+    //  2) COMMIT (non-transactional)
+    //  3) SET keyA (non-transactional)
+    //  4) SNAPSHOT OPEN <<--- keyA from step 3) should be returned
+    //  5) BEGIN TRANSACTION1 (isolation=FDB_ISOLATION_READ_COMMITTED)
+    //  6)    SNAPSHOT OPEN <<--- only keyA from step 1) should be visible
+    //  7)    SET keyA (transaction1)
+    //  8)    SNAPSHOT OPEN <<--- only keyA from step 7) should be visible
+    //  9) BEGIN TRANSACTION2 (isolation=FDB_ISOLATION_READ_UNCOMMITTED)
+    //  10)    SNAPSHOT OPEN <<--- keyA from step 7) should be visible
+    //  11)    SET keyA (transaction2)
+    //
+    //  keyA inserted in step 7) and 11) are not inserted into the global
+    //  shared snapshot tree. Only keyA from step1 and step3 are inserted
+    //  into their latest mutable snapshot trees.
+    //  So, in order to support the snapshot creations at steps 6), 8) and 10)
+    //  we must copy the all the WAL items for transactional snapshots........
+    //
+    // Now, continuing the above example..
+    // 12) END TRANSACTION2
+    // 13) END TRANSACTION1 - Last write wins - keyA from step 11) is overriden
+    // 14) SNAPSHOT OPEN <<--older keyA from step 7) returned
+    //
+    // Since transactional items are not inserted into any global tree,
+    // and TRANSACTION1 ended after TRANSACTION2, snapshot open cannot
+    // rely on the global shared snapshot trees anymore, because as
+    // per the global snapshot tree keyA from step3 is the latest
+    // As a result, until keyA from step7 is reflected in main index,
+    // we must copy all WAL items when in-memory snapshots are taken......
+
+    if (txn != &file->global_txn || // Snapshot in uncommitted transaction
+        // OR ..Transaction committed but yet to be flushed
+        atomic_get_uint8_t(&file->wal->unFlushedTransactions)) {
+        // TODO: We plan to optimize transactions & their snapshots in the future
+        fdb_status fs;
+        fs = wal_dur_snapshot_open(seqnum, key_cmp_info, file, txn,
+                                   shandle);
+        if (fs == FDB_RESULT_SUCCESS) {
+            fs = wal_copyto_snapshot(file, *shandle,
+                    (bool)key_cmp_info->kvs);
+        }
+        return fs;
+    } else { // In-memory snapshot using MVCC architecture..
+        // (handle->seqnum is only passed in for copying WAL
+        // For in-memory snapshots, correct seqnum will be obtained under the
+        // auspices of the WAL lock)
+        seqnum = FDB_SNAPSHOT_INMEM;
+    }
 
     spin_lock(&_wal->lock);
     kvs_snapshots = _wal_get_kvs_snaplist(_wal, kv_id);
@@ -1324,6 +1380,14 @@ fdb_status wal_commit(fdb_txn *txn, struct filemgr *file,
     size_t shard_num;
     uint64_t mem_overhead = 0;
 
+    if (txn != &file->global_txn) {
+        // Since transactions change latest mutable snapshot state
+        // Set following flag to inform future snapshot open to copy all
+        // items as opposed to MVCC
+        atomic_store_uint8_t(&file->wal->unFlushedTransactions, 1); 
+        // TODO: Make commit O(1)!
+    }
+
     e1 = list_begin(txn->items);
     while(e1) {
         item = _get_entry(e1, struct wal_item, list_elem_txn);
@@ -1600,6 +1664,11 @@ INLINE void _wal_snap_mark_flushed(struct wal *_wal)
             shandle->is_flushed = true;
         }
     }
+
+    // Since all committed transactions are now reflected in main index, until
+    // the next transactional commit, we can still safely do MVCC for snapshots
+    atomic_store_uint8_t(&_wal->unFlushedTransactions, 0);
+
     spin_unlock(&_wal->lock);
 }
 
@@ -3176,6 +3245,7 @@ fdb_status wal_shutdown(struct filemgr *file, err_log_callback *log_callback)
     atomic_store_uint64_t(&file->wal->datasize, 0);
     atomic_store_uint64_t(&file->wal->mem_overhead, 0);
     atomic_store_uint8_t(&file->wal->isPopulated, 0);
+    atomic_store_uint8_t(&file->wal->unFlushedTransactions, 0);
     return wr;
 }
 

@@ -1103,20 +1103,9 @@ fdb_snapshot_open_start:
                 btreeblk_discard_blocks(handle->bhandle);
             }
             // Having synced the dirty root, make an in-memory WAL snapshot
-            // TODO: Re-enable WAL sharing once ready...
 #ifdef _MVCC_WAL_ENABLE
-            if (txn == &file->global_txn) {
-                fs = wal_snapshot_open(handle->file, txn, kv_id, seqnum,
-                                       &cmp_info, &handle->shandle);
-            } else { // Snapshots from uncommitted transactions are isolated
-                fs = wal_dur_snapshot_open(handle->seqnum, &cmp_info, file, txn,
-                                           &handle->shandle);
-                if (fs == FDB_RESULT_SUCCESS) {
-                    fs = wal_copyto_snapshot(file, handle->shandle,
-                                            (bool)handle_in->kvs);
-                }
-                (void)kv_id;
-            }
+            fs = wal_snapshot_open(handle->file, txn, kv_id, handle->seqnum,
+                                   &cmp_info, &handle->shandle);
 #else
             fs = wal_dur_snapshot_open(handle->seqnum, &cmp_info, file, txn,
                                        &handle->shandle);

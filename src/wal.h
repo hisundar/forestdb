@@ -231,6 +231,8 @@ struct wal {
     atomic_uint64_t mem_overhead; // memory overhead of all WAL entries
     struct list txn_list; // list of active transactions
     wal_dirty_t wal_dirty;
+    // Are there uncommitted or, committed but not flushed, Transactions..
+    atomic_uint8_t unFlushedTransactions; //TODO:Transactional Snapshots
     // tree of all 'wal_item_header' (keys) in shard
     struct wal_shard *key_shards;
     // indexes 'wal_item's seq num in WAL shard
