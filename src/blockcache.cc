@@ -268,6 +268,10 @@ FileBlockCache *BlockCacheManager::chooseEvictionVictim() {
     size_t num_attempts;
 
     if (reader_lock(&fileListLock) == 0) {
+
+        victim_idx = rand() % fileList.size();
+        ret = fileList[victim_idx];
+        /*
         // Pick the victim that has the smallest access timestamp
         // among files randomly selected.
         num_attempts = fileList.size() / 10 + 1;
@@ -287,6 +291,7 @@ FileBlockCache *BlockCacheManager::chooseEvictionVictim() {
                 ret = fileList[victim_idx];
             }
         }
+        */
 
         if (ret) {
             ret->refCount++;
