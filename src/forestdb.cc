@@ -5511,6 +5511,7 @@ uint64_t WalFlushCallbacks::getOldOffset(void *dbhandle,
     FdbKvsHandle *handle = reinterpret_cast<FdbKvsHandle *>(dbhandle);
     uint64_t old_offset = 0;
 
+/* ------ DEBUG PATCH TO SKIP OLD OFFSET RETRIEVAL -----
     if (item->action == WAL_ACT_REMOVE) {
         // For immediate remove, old_offset value is critical
         // so that we should get an exact value.
@@ -5525,6 +5526,7 @@ uint64_t WalFlushCallbacks::getOldOffset(void *dbhandle,
     handle->bhandle->flushBuffer();
     old_offset = _endian_decode(old_offset);
 
+*/
     return old_offset;
 }
 
