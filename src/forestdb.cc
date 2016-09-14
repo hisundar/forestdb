@@ -1976,7 +1976,7 @@ fdb_status FdbEngine::init(fdb_config *config) {
             // Initialize background flusher daemon
             // Temporarily disable background flushers until blockcache contention
             // issue is resolved.
-            bgf_config.num_threads = 0; //_config.num_bgflusher_threads;
+            bgf_config.num_threads = 8; //_config.num_bgflusher_threads;
             BgFlusher::createBgFlusher(&bgf_config);
             // Initialize HBtrie's memory pool
             HBTrie::initMemoryPool(get_num_cores(), _config.buffercache_size);
