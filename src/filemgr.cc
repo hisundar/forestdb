@@ -1222,10 +1222,12 @@ uint64_t FileMgr::updateHeader(void *buf,
     memcpy(fMgrHeader.data, buf, len);
     fMgrHeader.size = len;
 
-    if (inc_revnum) {
-        ++fMgrHeader.revnum;
-    }
     ret = fMgrHeader.revnum;
+    if (inc_revnum) {
+        // The actual revnum will be updated along with fMgrHeader.bid
+        // as part of FileMgr::commitBid after persisting header to disk
+        ret++;
+    }
 
     releaseSpinLock();
     return ret;
@@ -2527,6 +2529,7 @@ fdb_status FileMgr::commitBid(bid_t bid, uint64_t bmp_revnum, bool sync,
             addStaleBlock(prev_bid * blockSize, blockSize);
         }
 
+        ++fMgrHeader.revnum; // update the header along with bid
         fMgrHeader.bid = bid;
         if (!block_reusing) {
             lastPos.fetch_add(blockSize);

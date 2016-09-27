@@ -1226,13 +1226,9 @@ stale_header_info fdb_get_smallest_active_header(FdbKvsHandle *handle)
 
         if (ret.bid == handle->last_hdr_bid) {
             // header in 'handle->last_hdr_bid' is not written into file yet!
-            // we should start from the previous header
+            // we should start from the previous header and revnum
             hdr_bid = handle->file->accessHeader()->bid.load();
-            // Since the file header would already have the latest revnum
-            // as part of the fdb_set_file_header() called before this function
-            // but NOT the latest hdr_bid (updated later by filemgr commit)
-            // we must use the revnum - 1 to correspond to the hdr_bid above
-            hdr_revnum = handle->file->accessHeader()->revnum - 1;
+            hdr_revnum = handle->file->accessHeader()->revnum;
         } else {
             hdr_bid = ret.bid;
             hdr_revnum = ret.revnum;

@@ -3812,7 +3812,7 @@ fdb_commit_start:
             // header should be updated one more time
             // since block reclaiming or stale block gathering changes root nodes
             // of each tree. but at this time we don't increase header revision number.
-            handle->cur_header_revnum = fdb_set_file_header(handle, false);
+            handle->cur_header_revnum = fdb_set_file_header(handle, true);
             sb->updateHeader(handle);
             sb->syncCircular(handle);
             // reset allocation counter for next reclaim check
