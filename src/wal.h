@@ -33,7 +33,10 @@ enum{
 };
 
 struct wal_item_header{
-    struct avl_node avl_key;
+    union {
+        struct avl_node avl_key;
+        struct hash_elem hash_key;
+    };
     void *key;
     uint16_t keylen;
     uint8_t chunksize;

@@ -236,8 +236,206 @@ void wal_ref_ptr_test()
     TEST_RESULT("wal reference pointer test");
 }
 
-int main() {
+#include<chrono>
+#include<algorithm>
+#include<vector>
+#include<set>
+#include "checksum.h"
+#define NBUCKET 65536
 
+INLINE int _wal_keycmp(void *key1, size_t keylen1, void *key2, size_t keylen2)
+{
+    if (keylen1 == keylen2) {
+        return memcmp(key1, key2, keylen1);
+    } else {
+        size_t len = MIN(keylen1, keylen2);
+        int cmp = memcmp(key1, key2, len);
+        if (cmp != 0) return cmp;
+        else {
+            return (int)((int)keylen1 - (int)keylen2);
+        }
+    }
+}
+
+INLINE int _wal_kvs_cmp(struct avl_node *a, struct avl_node *b, void *aux)
+{
+    struct wal_item_header *aa, *bb;
+    aa = _get_entry(a, struct wal_item_header, avl_key);
+    bb = _get_entry(b, struct wal_item_header, avl_key);
+
+    return _wal_keycmp(aa->key, aa->keylen, bb->key, bb->keylen);
+}
+
+INLINE int _wal_hash_cmp(struct hash_elem *a, struct hash_elem *b)
+{
+    struct wal_item_header *aa, *bb;
+    aa = _get_entry(a, struct wal_item_header, hash_key);
+    bb = _get_entry(b, struct wal_item_header, hash_key);
+
+    return _wal_keycmp(aa->key, aa->keylen, bb->key, bb->keylen);
+}
+
+
+struct hasher {
+    size_t operator() (const struct wal_item_header *a) const {
+        return get_checksum((const uint8_t *)a->key, a->keylen, CRC_DEFAULT);
+    }
+} hash_crc;
+
+static uint32_t _wal_hasher(struct hash *hash, struct hash_elem *e)
+{
+    struct wal_item_header *a = _get_entry(e, struct wal_item_header, hash_key);
+    return ((unsigned)get_checksum((const uint8_t *)a->key, a->keylen, CRC_DEFAULT) &  (NBUCKET-1)); 
+}
+
+struct lex_comparator {
+    bool operator()(struct wal_item_header *a,
+                           struct wal_item_header *b) {
+        return (_wal_keycmp(a->key, a->keylen, b->key, b->keylen) < 0);
+    }
+} compare_less;
+
+void free_func(struct hash_elem *ha) {
+    struct wal_item_header *h = _get_entry(ha, struct wal_item_header, hash_key);
+    delete h;
+}
+
+uint64_t load_test(int n, int opt) {
+
+
+    // Following indexes are tested..
+    std::vector<wal_item_header *> indexV;
+    std::set<wal_item_header *, lex_comparator> indexM;
+    std::unordered_set<wal_item_header *, hasher> indexU;
+    struct avl_tree indexA;
+    struct hash indexH;
+    if (opt == 0) {
+        indexV.reserve(n);
+    } else if (opt == 2){
+        avl_init(&indexA, NULL);
+    } else if (opt == 3) {
+        hash_init(&indexH, NBUCKET, _wal_hasher, _wal_hash_cmp);
+    } else if (opt == 4) {
+        indexU.reserve(n);
+    }
+
+    struct wal_item_header **headers = new struct wal_item_header*[n];
+    char **keyz = new char *[n*16];
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < n; ++i) {
+        headers[i] = new struct wal_item_header();
+        keyz[i] = new char[16];
+        sprintf(keyz[i], "%08dk%06d", i, i); // , i); //rand()%1000000);
+        headers[i]->key = keyz[i];
+        headers[i]->keylen = 16;
+        if (opt == 0) {
+            indexV.push_back(headers[i]);
+        } else if (opt == 1) {
+            indexM.insert(headers[i]);
+        } else if (opt == 2) {
+            avl_insert(&indexA, &headers[i]->avl_key, _wal_kvs_cmp);
+        } else if (opt == 3) {
+            hash_insert(&indexH, &headers[i]->hash_key);
+        } else if (opt == 4) {
+            indexU.insert(headers[i]);
+        }
+    }
+    if (opt == 0) {
+        std::sort(indexV.begin(), indexV.end(), compare_less);
+    }
+
+    auto access_start = std::chrono::high_resolution_clock::now();
+    if (opt == 0) {
+        for (auto it = indexV.begin(); it != indexV.end(); ++it) {
+            struct wal_item_header *hdr = (*it);
+            delete ((char *)hdr->key);
+            delete hdr;
+            //printf("set key = %s\n", (*it)->key);
+        }
+    } else if (opt == 1) {
+        for (auto it = indexM.begin(); it != indexM.end(); ++it) {
+            struct wal_item_header *hdr = (*it);
+            delete ((char *)hdr->key);
+            delete hdr;
+            //printf("set key = %s\n", (*it)->key);
+        }
+    } else if (opt == 2) {
+        for (auto it = avl_first(&indexA); it; it = avl_next(it)) {
+            struct wal_item_header *hdr = _get_entry(it, wal_item_header, avl_key);
+            delete ((char *)hdr->key);
+            //printf("set key = %s\n", (*it)->key);
+        }
+        for (int i = 0; i < n; ++i) {
+            delete headers[i];
+        }
+    } else if (opt == 3) {
+        hash_free_active(&indexH, free_func);
+    } else if (opt == 4) {
+        for (auto it = indexU.begin(); it != indexU.end(); ++it) {
+            struct wal_item_header *hdr = (*it);
+            delete ((char *)hdr->key);
+            delete hdr;
+            //printf("set key = %s\n", (*it)->key);
+        }
+    }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto diff1 = std::chrono::duration_cast<std::chrono::microseconds>(end_time
+                  - access_start).count();
+    auto diff = std::chrono::duration_cast<std::chrono::microseconds>(end_time
+                  - start_time).count();
+    uint64_t adiff = uint64_t(diff1);
+    uint64_t tdiff = uint64_t(diff);
+    if (opt == 0) {
+        fprintf(stdout, "Indexing %d items with vector and sorting took %"
+                _F64 "us total\t%" _F64 "us to index\t%" _F64 "us to access\n", n, tdiff, tdiff - adiff, adiff);
+    } else if (opt == 1) {
+        fprintf(stdout, "Indexing %d items into a sorted std::set took  %"
+                _F64 "us total\t%" _F64 "us to index\t%" _F64 "us to access\n", n, tdiff, tdiff - adiff, adiff);
+    } else if (opt == 2) {
+        fprintf(stdout, "Indexing %d items into a sorted avl tree took  %"
+                _F64 "us total\t%" _F64 "us to index\t%" _F64 "us to access\n", n, tdiff, tdiff - adiff, adiff);
+    } else if (opt == 3) {
+        fprintf(stdout, "Indexing %d items into unsorted avl hash took  %"
+                _F64 "us total\t%" _F64 "us to index\t%" _F64 "us to access\n", n, tdiff, tdiff - adiff, adiff);
+    } else if (opt == 4) {
+        fprintf(stdout, "Indexing %d items into unsorted set took       %"
+                _F64 "us total\t%" _F64 "us to index\t%" _F64 "us to access\n", n, tdiff, tdiff - adiff, adiff);
+    }
+
+    delete [] keyz;
+    delete [] headers;
+    return tdiff;
+}
+
+void load_tester(int num_items) {
+    std::map<uint64_t, int> times;
+    for (int i = 0; i < 5; ++i)
+        times.insert(std::make_pair(load_test(num_items, i), i));
+    uint64_t prev = 0;
+    for (auto it = times.begin(); it != times.end(); ++it) {
+        switch(it->second) {
+            case 0: printf("Vector"); break;
+            case 1: printf("Set"); break;
+            case 2: printf("AVL Tree"); break;
+            case 3: printf("FDB Hash"); break;
+            case 4: printf("STL set"); break;
+        }
+        if (prev) {
+            printf(" %llu us %llu percent slower\n", it->first, (it->first - prev) * 100 / it->first);
+        } else {
+            printf(" %llu winner!\n", it->first);
+            prev = it->first;
+        }
+    }
+}
+
+int main() {
+    load_tester(4096);
+    load_tester(40960);
+    load_tester(819200);
+    return 0;
     wal_basic_test();
     wal_ref_ptr_test();
 
