@@ -207,8 +207,12 @@ private:
     bool snapshotHandle;
     // HB+Trie iterator instance
     HBTrieIterator *hbtrieIterator;
-    // B+Tree iterator for sequence number iteration
-    BTreeIterator *seqtreeIterator;
+    union {
+        // B+Tree V2 iterator for sequence iteration in BtreeV2 format..
+        BtreeIteratorV2 *seqtreeIteratorV2;
+        // B+Tree iterator for sequence number iteration
+        BTreeIterator *seqtreeIterator;
+    };
     // HB+Trie iterator for sequence number iteration (for multiple KV instance mode)
     HBTrieIterator *seqtrieIterator;
     // Current seqnum pointed by the iterator

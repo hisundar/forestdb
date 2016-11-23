@@ -226,6 +226,15 @@ public:
     BtreeV2Result readMeta( BtreeV2Meta& meta );
 
     /**
+     * For a clean Btree directly return pointer to the root bnode's
+     * meta data section avoiding a memcpy operation
+     *
+     * @param meta Reference to meta data to be retrned.
+     * @return SUCCESS on success.
+     */
+    BtreeV2Result getMeta( BtreeV2Meta& meta );
+
+    /**
      * Insert a set of key-value pairs into the tree.
      * Note that all pairs MUST be sorted in a key order.
      *

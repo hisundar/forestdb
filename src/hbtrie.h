@@ -25,6 +25,7 @@
 #include "memory_pool.h"
 
 #include <unordered_map>
+#include <vector>
 
 #ifdef __cplusplus
 extern "C" {
@@ -348,6 +349,7 @@ typedef btree_new_cmp_func* HBTrieV2GetCmpFunc(HBTrie *hbtrie,
  * HB+trie handle definition.
  */
 class HBTrie {
+    friend class HBTrieIterator; // friend access specifier for MPWrapper
 public:
     HBTrie();
 
@@ -471,6 +473,10 @@ public:
 
     void setCmpFuncCB(HBTrieV2GetCmpFunc *cb_func) {
         getCmpFuncCB = cb_func;
+    }
+
+    bool isCmpFuncSet() const {
+        return map ? true : false;
     }
 
     inline void valueSetMsb(void *value);
@@ -929,9 +935,119 @@ private:
 
 };
 
-#define HBTRIE_ITERATOR_REV    0x01
-#define HBTRIE_ITERATOR_FAILED 0x02
-#define HBTRIE_ITERATOR_MOVED  0x04
+inline int lex_key_cmp(void *aa, size_t aa_keylen, void *bb, size_t bb_keylen) {
+    if (aa_keylen == bb_keylen) {
+        return memcmp(aa, bb, aa_keylen);
+    } else {
+        size_t len = MIN(aa_keylen, bb_keylen);
+        int cmp = memcmp(aa, bb, len);
+        if (cmp != 0) {
+            return cmp;
+        } else {
+            return static_cast<int>( static_cast<int>(aa_keylen) -
+                    static_cast<int>(bb_keylen) );
+        }
+    }
+}
+
+/**
+ * A wrapper class around BtreeIteratorV2 that is aware of the skipped key
+ * prefix AND/OR the value that may exist in the HBTrie Meta section of the
+ * root Btree's bnode. It adjusts the iterator cursors to reflect the additional
+ * presence of the element in the Meta section.
+ */
+class BtreeIterWrapper {
+public:
+     /**
+      * @param _trie - Parent HB+Trie instance
+      * @param rootAddr - Address of the root node of the B+Tree
+      * @param cmp_func - custom compare function (if exists)
+      */
+     BtreeIterWrapper(HBTrie *_trie, BtreeNodeAddr rootAddr,
+                      btree_new_cmp_func *cmp_func);
+     ~BtreeIterWrapper();
+
+     /**
+      * Checks the HB Meta section and returns the chunk number stored in it
+      */
+     int getBtreeChunkno();
+
+     /**
+      * Reads the (skipped) key prefix in the HB Meta section and returns it
+      * as a KV pair where value may point to the actual document offset
+      * @param retKvp (out) - fills up this KV pair from the HB Meta section.
+      * @return TRUE if HB Meta points to a document offset, FALSE otherwise
+      */
+     bool getCommonPrefix(BtreeKvPair *retKvp);
+
+     /**
+      * Reads the (skipped) key prefix in the HB Meta section and returns it
+      * as a KV pair where value may point to the actual document offset
+      * @param retKvp (out) - fills up this KV pair from the HB Meta section.
+      * @return TRUE if KV pair returned is from B+Tree, FALSE if it is from
+      *           the HB Meta section of the root B+Tree
+      */
+     bool getKvpHT(BtreeKvPair *retKvp);
+
+     /**
+      * Position the cursor to the start of the B+Tree
+      * This start may be the HB Meta section of the root B+Tree OR its actual
+      * iterator element.
+      */
+     BnodeIteratorResult beginHT();
+
+     /**
+      * Position the cursor to the key greater or equal to the key passed.
+      * For custom compare functions, the entire keylength is compared, for
+      * normal iterators, a max of chunksize is compared along with any prefix
+      * in the HB Meta section.
+      * @param key - Key or its subsection to be compared against
+      * @param keylen - full length of the key to be searched.
+      */
+     BnodeIteratorResult greaterOrEqualHT(void *key, size_t keylen);
+
+     /**
+      * Position the cursor to the key smaller or equal than the key passed.
+      * For custom compare functions, the entire keylength is compared, for
+      * normal iterators, a max of chunksize is compared along with any prefix
+      * in the HB Meta section.
+      * @param key - Key or its subsection to be compared against
+      * @param keylen - full length of the key to be searched.
+      */
+     BnodeIteratorResult smallerOrEqualHT(void *key, size_t keylen);
+
+     /**
+      * Position the cursor to the end of the B+Tree
+      * This end may be the HB Meta section of the root B+Tree OR its actual
+      * iterator element.
+      */
+     BnodeIteratorResult endHT();
+
+     /** Retrieve the next higher element from the B+Tree
+      */
+     BnodeIteratorResult nextHT();
+
+     /** Retrieve the previous lower element from the B+Tree
+      */
+     BnodeIteratorResult prevHT();
+private:
+     BtreeIteratorV2 *btreeItr; // The actual BtreeIteratorV2
+     HBTrie *trie; // Pointer to the parent HB+Trie
+     // If this is set, it means cursor is pointing to document offset in the
+     // HB Trie's Meta data store in the Root B+Tree Node's Metadata section.
+     bool isKeyInMeta;
+
+     /**
+      * Internal wrapper to read the root B+Tree's bnode and return the HB Meta
+      * @param hbmeta (out) - fills up this struct with hbtrie_meta from root
+      */
+     void readHBMeta(struct hbtrie_meta *hbmeta);
+};
+
+#define HBTRIE_ITERATOR_FWD    0x01
+#define HBTRIE_ITERATOR_REV    0x02
+#define HBTRIE_ITERATOR_FAILED 0x04
+#define HBTRIE_ITERATOR_MOVED  0x08
 
 /**
  * HB+trie iterator handle definition.
@@ -981,10 +1097,95 @@ public:
 
 private:
     HBTrie *trie;
+    std::vector<BtreeIterWrapper *> btreeItrs;
+    static const int initialBtreeIterSize;
     struct list btreeit_list;
     void *curkey;
     size_t keylen;
+    int leafChunkno; // Used for BtreeIteratorV2
     uint8_t flags;
+
+    /**
+     * Consider following keys in HB+Trie with chunksize as 1 byte..
+     *  A, AB, AC, X, XY
+     *                       _______________________btreeItrs[0]
+     *                      |                        .
+     *                      v                        .
+     *                     [A  X]                    .
+     *                     /    \                    .
+     *   [ A(meta)|| B, C ]      [X (meta)|| Y ]   _btreeItrs[1]
+     *      ^                                      |
+     *      |                                      |
+     *      L--------------------------------------J
+     *
+     * @param key_buf (out) Pointer to key buffer which is to be filled up
+     *                the key currently pointed to by the HB+Trie Iterator.
+     * @param keylen_out Value of the key lenght of key at cursor.
+     * @param value_buf (out) pointer to value part of key at cursor.
+     */
+    hbtrie_result copyCurKvp(void *key_buf,
+                             size_t &keylen_out, void *value_buf);
+
+    int cmpCurKvp(void *key, int keylen);
+    /**
+     * @param index into the btreeItrs to set given BtreIterWrapper pointer
+     * @param hit BtreeIterWrapper object pointer to store
+     */
+    void setBtreeIterAt(int chunkno, BtreeIterWrapper *hit);
+
+    /**
+     * @param chunkno - release memory of all BtreeIters higher than this index
+     */
+    void shrinkBtreeItersTo(int chunkno);
+
+    /**
+     * Recursively position the HB+Trie Iterator to the first key in trie.
+     * @param nodeAddr - address of the root B+Tree at this chunk no
+     * @param prevChunkno - previous chunk number to detect skipped prefixes.
+     * @return HBTRIE_RESULT_SUCCESS if a key is found
+     */
+    hbtrie_result beginHBT(BtreeNodeAddr nodeAddr, int prevChunkno);
+
+    /**
+     * Recursively position the HB+Trie Iterator to the key greater or equal to
+     * the given key in trie.
+     * @param nodeAddr - address of the root B+Tree at this chunk no
+     * @param prevChunkno - previous chunk number to detect skipped prefixes.
+     * @return HBTRIE_RESULT_SUCCESS if a key is found
+     */
+    hbtrie_result greaterOrEqualHBT(BtreeNodeAddr nodeAddr, int prevChunkno,
+                                    void *key, size_t keylen);
+
+    /**
+     * Recursively position the HB+Trie Iterator to the key smaller or equal to
+     * the given key in trie.
+     * @param nodeAddr - address of the root B+Tree at this chunk no
+     * @param prevChunkno - previous chunk number to detect skipped prefixes.
+     * @return HBTRIE_RESULT_SUCCESS if a key is found
+     */
+    hbtrie_result smallerOrEqualHBT(BtreeNodeAddr nodeAddr,
+                                    int prevChunkno,
+                                    void *key, size_t keylen);
+
+    /**
+     * Recursively position the HB+Trie Iterator to the last key in the trie.
+     * @param nodeAddr - address of the root B+Tree at this chunk no
+     * @param prevChunkno - previous chunk number to detect skipped prefixes.
+     * @return HBTRIE_RESULT_SUCCESS if a key is found
+     */
+    hbtrie_result endHBT(BtreeNodeAddr nodeAddr, int prevChunkno);
+
+    /**
+     * Recursively traverse up and down the cursors to the next higher key.
+     * @param chunkno - the current cursor's chunk number
+     */
+    hbtrie_result nextHBT(int chunkno);
+
+    /**
+     * Recursively traverse up and down the cursors to the previous lower key.
+     * @param chunkno - the current cursor's chunk number
+     */
+    hbtrie_result prevHBT(int chunkno);
 
     hbtrie_result _prev(struct btreeit_item *item,
                         void *key_buf,
@@ -1003,15 +1204,17 @@ private:
     }
 
     inline bool flagsIsFwd() {
-        return !(flags & HBTRIE_ITERATOR_REV);
+        return (flags & HBTRIE_ITERATOR_FWD);
     }
 
     inline void flagsSetRev() {
+        flags &= ~HBTRIE_ITERATOR_FWD;
         flags |= HBTRIE_ITERATOR_REV;
     }
 
     inline void flagsSetFwd() {
         flags &= ~HBTRIE_ITERATOR_REV;
+        flags |= HBTRIE_ITERATOR_FWD;
     }
 
     inline bool flagsIsFailed() {
@@ -1032,6 +1235,10 @@ private:
 
     inline void flagsSetMoved() {
         flags |= HBTRIE_ITERATOR_MOVED;
+    }
+
+    inline void flagsClrMoved() {
+        flags &= ~HBTRIE_ITERATOR_MOVED;
     }
 
     inline void getLeafKey(void *key, void *str, size_t& len)

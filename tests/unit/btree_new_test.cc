@@ -2348,6 +2348,181 @@ void hbtriev2_partial_update_test()
     TEST_RESULT("hb+trie V2 partial update test");
 }
 
+void hbtriev2_iterator_test()
+{
+    // test case for most common insertion iteration cases
+    TEST_INIT();
+
+    HBTrie *hbtrie;
+    hbtrie_result hr;
+    BnodeMgr *b_mgr;
+    HBTrieIterator *hit;
+    FileMgrConfig config(4096, 3906, 1048576, 0, 0, FILEMGR_CREATE,
+                         FDB_SEQTREE_NOT_USE, 0, 8, 0, FDB_ENCRYPTION_NONE,
+                         0x00, 0, 0);
+    filemgr_open_result fr;
+    std::string fname("./hbtrie_new_testfile");
+
+    int r = system(SHELL_DEL" hbtrie_new_testfile");
+    (void)r;
+
+    fr = FileMgr::open(fname, get_filemgr_ops(), &config, NULL);
+    // set file version to 003
+    fr.file->setVersion(FILEMGR_MAGIC_003);
+
+    size_t i;
+    uint64_t offset;
+    const char *keystrs[] = {"AAAAAAAA",
+                             "AAAAAAAABBBBBBBB",
+                             "AAAAAAAADDDDDDDD",
+                             "XXXXXXXX",
+                             "XXXXXXXXXXXXXXXXYYYYYYYYZZZZZZZZ",
+                             "XXXXXXXXYYYYYYYY",
+                             "XXXXXXXXYYYYYYYYYYYYYYYY"};
+    size_t n = 7;
+
+    BnodeCacheMgr::init(16000000, 16000000);
+    BnodeCacheMgr::get()->createFileBnodeCache(fr.file);
+    b_mgr = new BnodeMgr();
+    b_mgr->setFile(fr.file);
+
+    BtreeNodeAddr init_root;
+    hbtrie = new HBTrie(8, 4096, init_root, b_mgr, fr.file);
+
+    for (i = 0; i < n; ++i) {
+        offset = i*100;
+        offset = _endian_encode(offset);
+        hr = hbtrie->insert((void *)keystrs[i], strlen(keystrs[i]), &offset,
+                            nullptr);
+        TEST_CHK(hr == HBTRIE_RESULT_SUCCESS);
+    }
+
+    hbtrie->writeDirtyNodes();
+    b_mgr->moveDirtyNodesToBcache();
+    BnodeCacheMgr::get()->flush(fr.file);
+
+    // retrieval check (clean)
+    for (i=0; i<n; ++i) {
+        offset = 0;
+        hr = hbtrie->find((void *)keystrs[i], strlen(keystrs[i]), &offset);
+        TEST_CHK(hr == HBTRIE_RESULT_SUCCESS);
+        offset = _endian_decode(offset);
+        TEST_CHK(offset == i*100);
+    }
+
+    char key_out[33];
+    size_t keylen_out;
+    hit = new HBTrieIterator(hbtrie, nullptr, 0);
+
+    i = 0;
+    while (hit->next(key_out, keylen_out, &offset) == HBTRIE_RESULT_SUCCESS) {
+        offset = _endian_decode(offset);
+        TEST_CHK(offset == i * 100);
+        TEST_CMP(key_out, keystrs[i], strlen(keystrs[i]));
+        i++;
+    }
+    TEST_CHK(i == n);
+
+    // Now reverse iterate back up to start..
+    while (hit->prev(key_out, keylen_out, &offset) == HBTRIE_RESULT_SUCCESS) {
+        offset = _endian_decode(offset);
+        i--;
+        TEST_CHK(offset == i * 100);
+    }
+    TEST_CHK(i == 0);
+
+    // Forward iterate to end again..
+    while (hit->next(key_out, keylen_out, &offset) == HBTRIE_RESULT_SUCCESS) {
+        offset = _endian_decode(offset);
+        TEST_CHK(offset == i * 100);
+        TEST_CMP(key_out, keystrs[i], strlen(keystrs[i]));
+        i++;
+    }
+    TEST_CHK(i == n);
+
+    delete hit;
+
+    hit = new HBTrieIterator(hbtrie, nullptr, 0);
+    // Test last() (Reverse Iteration)..
+    hr = hit->last();
+    TEST_CHK(hr == HBTRIE_RESULT_SUCCESS);
+
+    i = n;
+    while (hit->prev(key_out, keylen_out, &offset) == HBTRIE_RESULT_SUCCESS) {
+        offset = _endian_decode(offset);
+        i--;
+        TEST_CHK(offset == i * 100);
+    }
+    TEST_CHK(i == 0);
+
+    delete hit;
+
+    const char *seekGreaterCase0 = "XXXXXXXXYYYYYYYY";
+    hit = new HBTrieIterator(hbtrie, (void *)seekGreaterCase0,
+                             strlen(seekGreaterCase0));
+    i = 5;
+    while (hit->next(key_out, keylen_out, &offset) == HBTRIE_RESULT_SUCCESS) {
+        offset = _endian_decode(offset);
+        TEST_CHK(offset == i * 100);
+        TEST_CMP(key_out, keystrs[i], strlen(keystrs[i]));
+        i++;
+    }
+    TEST_CHK(i == n);
+
+    delete hit;
+
+    const char *seekGreaterCase1 = "AAAAAAAACCCCCCCC";
+    hit = new HBTrieIterator(hbtrie, (void *)seekGreaterCase1,
+                             strlen(seekGreaterCase1));
+    i = 2;
+    while (hit->next(key_out, keylen_out, &offset) == HBTRIE_RESULT_SUCCESS) {
+        offset = _endian_decode(offset);
+        TEST_CHK(offset == i * 100);
+        TEST_CMP(key_out, keystrs[i], strlen(keystrs[i]));
+        i++;
+    }
+    TEST_CHK(i == n);
+
+    delete hit;
+
+    const char *seekGreaterCase2 = "AAAAAAAAEEEEEEEE";
+    hit = new HBTrieIterator(hbtrie, (void *)seekGreaterCase2,
+                             strlen(seekGreaterCase2));
+    i = 3;
+    while (hit->next(key_out, keylen_out, &offset) == HBTRIE_RESULT_SUCCESS) {
+        offset = _endian_decode(offset);
+        TEST_CHK(offset == i * 100);
+        TEST_CMP(key_out, keystrs[i], strlen(keystrs[i]));
+        i++;
+    }
+    TEST_CHK(i == n);
+
+    delete hit;
+
+    const char *seekGreaterCase3 = "88888888";
+    hit = new HBTrieIterator(hbtrie, (void*)seekGreaterCase3,
+                             strlen(seekGreaterCase3));
+    i = 0;
+    while (hit->next(key_out, keylen_out, &offset) == HBTRIE_RESULT_SUCCESS) {
+        offset = _endian_decode(offset);
+        TEST_CHK(offset == i * 100);
+        TEST_CMP(key_out, keystrs[i], strlen(keystrs[i]));
+        i++;
+    }
+    TEST_CHK(i == n);
+    delete hit;
+
+    delete hbtrie;
+    delete b_mgr;
+
+    FileMgr::close(fr.file, true, NULL, NULL);
+
+    BnodeCacheMgr::destroyInstance();
+
+    FileMgr::shutdown();
+
+    TEST_RESULT("hb+trie V2 iterator test");
+}
 
 btree_new_cmp_func* hbtriev2_cmp_func_callback(HBTrie *hbtrie,
                                                uint64_t kvs_id,
@@ -2638,6 +2813,8 @@ int main()
     hbtriev2_partial_update_test();
     hbtriev2_custom_cmp_test();
     hbtriev2_variable_length_value_test();
+    hbtriev2_iterator_test();
+
     return 0;
 }
 

@@ -299,6 +299,26 @@ BtreeV2Result BtreeV2::readMeta( BtreeV2Meta& meta )
     return BtreeV2Result::SUCCESS;
 }
 
+BtreeV2Result BtreeV2::getMeta( BtreeV2Meta & meta )
+{
+
+    if ( rootAddr.isEmpty ) {
+        // B+tree has not been populated yet.
+        return BtreeV2Result::EMPTY_BTREE;
+    }
+
+    if (rootAddr.isDirty) {
+        // This function cannot be invoked on a dirty btree
+        return BtreeV2Result::EMPTY_BTREE;
+    }
+
+    Bnode *node = getRootNode();
+    meta.size = node->getMetaSize();
+    meta.ctx = node->getMeta();
+
+    return BtreeV2Result::SUCCESS;
+}
+
 BtreeV2Result BtreeV2::insertMulti( std::vector<BtreeKvPair>& kv_list )
 {
     BtreeV2Result br = BtreeV2Result::SUCCESS;

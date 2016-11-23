@@ -260,9 +260,19 @@ FdbIterator::FdbIterator(FdbKvsHandle *_handle,
         query.seqnum = start_seq;
         treeCursor = walIterator->searchGreater_WalItr(&query);
     } else {
-        // create an iterator handle for b-tree
-        seqtreeIterator = new BTreeIterator(iterHandle->seqtree,
+        if (ver_btreev2_format(iterHandle->file->getVersion())) {
+            // create an iterator handle for b-treeV2
+            if (start_seq) {
+                seqtreeIteratorV2 = new BtreeIteratorV2(iterHandle->seqtreeV2,
+                              (void *)&_start_seq, size_seq);
+            } else {
+                seqtreeIteratorV2 = new BtreeIteratorV2(iterHandle->seqtreeV2);
+            }
+        } else {
+            // create an iterator handle for b-tree
+            seqtreeIterator = new BTreeIterator(iterHandle->seqtree,
                               (void *)( start_seq ? (&_start_seq) : (NULL) ));
+        }
 
         query.seqnum = start_seq;
         treeCursor = walIterator->searchGreater_WalItr(&query);
@@ -284,16 +294,15 @@ FdbIterator::~FdbIterator()
         delete hbtrieIterator;
     }
 
-    if (seqtreeIterator) {
-        delete seqtreeIterator;
-    }
-
     if (seqtrieIterator) {
         delete seqtrieIterator;
     }
 
     if (ver_btreev2_format(iterHandle->file->getVersion())) {
+        delete seqtreeIteratorV2;
         iterHandle->bnodeMgr->releaseCleanNodes();
+    } else {
+        delete seqtreeIterator;
     }
 
     if (iterType == FDB_ITR_REG) {
@@ -561,6 +570,12 @@ fdb_status FdbIterator::seek(const void *seek_key,
 
     // reset HB+trie's iterator
     delete hbtrieIterator;
+
+    // To support direction change, stash seek key in iterator
+    // so the next & prev passed to HBTrieIterator has context
+    memcpy(iterKey.data, seek_key_kv, seek_keylen_kv);
+    iterKey.len = seek_keylen_kv;
+
     hbtrieIterator = new HBTrieIterator(iterHandle->trie,
                                         seek_key_kv, seek_keylen_kv);
 
@@ -972,6 +987,8 @@ fdb_status FdbIterator::seekToMin() {
     delete hbtrieIterator;
     hbtrieIterator = new HBTrieIterator(iterHandle->trie,
                                         startKey.data, startKey.len);
+    memcpy(iterKey.data, startKey.data, startKey.len);
+    iterKey.len = startKey.len;
 
     // reset WAL tree cursor using search because of the sharded nature of WAL
     if (treeCursorStart) {
@@ -1442,6 +1459,11 @@ fdb_status FdbIterator::seekToMaxKey() {
         hbtrieIterator = new HBTrieIterator(iterHandle->trie,
                                             endKey.data,
                                             endKey.len);
+        // Since we are changing direction, also ensure that iterKey.data
+        // holds a copy of the endKey so that the trie iterator can change
+        // directions
+        memcpy(iterKey.data, endKey.data, endKey.len);
+        iterKey.len = endKey.len;
 
         // get first key
         hbtrieIterator->prev(iterKey.data, iterKey.len, (void*)&iterOffset);
@@ -1489,11 +1511,20 @@ fdb_status FdbIterator::seekToMaxSeq() {
                                              end_seq_kv,
                                              sizeof(size_t)*2);
     } else {
-        // reset Btree iterator to end_seqnum
-        delete seqtreeIterator;
-        // create an iterator handle for b-tree
-        seqtreeIterator = new BTreeIterator(iterHandle->seqtree,
-                                            (void *)(&endSeqnum));
+        if (ver_btreev2_format(iterHandle->file->getVersion())) {
+            if (endSeqnum) {
+                seqtreeIteratorV2->seekSmallerOrEqualBT(&endSeqnum,
+                                                        sizeof(endSeqnum));
+            } else {
+                seqtreeIteratorV2->endBT();
+            }
+        } else {
+            // reset Btree iterator to end_seqnum
+            delete seqtreeIterator;
+            // create an iterator handle for b-tree
+            seqtreeIterator = new BTreeIterator(iterHandle->seqtree,
+                                                (void *)(&endSeqnum));
+        }
     }
 
     if (endSeqnum != SEQNUM_NOT_USED) {
@@ -1558,6 +1589,15 @@ fdb_status FdbIterator::iterateSeqPrev() {
     if (iterDirection != FDB_ITR_REVERSE) {
         if (iterStatus == FDB_ITR_IDX) {
             iterOffset = BLK_NOT_FOUND; // need to re-examine Trie/trees
+            if (iterHandle->kvs) { // multi KV instance mode
+                // If we need to re-examine the Trie/trees, we must pass in
+                // the last successfully read seqnum from that so direction
+                // change is possible
+                seqnum = _endian_encode(seqNum);
+                kvid2buf(size_id, iterHandle->kvs->getKvsId(), seq_kv);
+                memcpy(seq_kv + size_id, &seqnum, size_seq);
+                seq_kv_len = size_id + size_seq;
+            }
         }
         // re-position WAL key to previous key returned using search because of
         // sharded nature of wal (we cannot directly assign prev to cursor)
@@ -1588,7 +1628,18 @@ start_seq:
                 br = BTREE_RESULT_FAIL;
             }
         } else {
-            br = seqtreeIterator->prev(&seqnum, (void *)&offset);
+            if (ver_btreev2_format(iterHandle->file->getVersion())) {
+                if (seqtreeIteratorV2->prevBT() != BnodeIteratorResult::SUCCESS) {
+                    BtreeKvPair kv_pair = seqtreeIteratorV2->getKvBT();
+                    seqnum = *(static_cast<fdb_seqnum_t *>(kv_pair.key));
+                    offset = *(static_cast<bid_t *>(kv_pair.value));
+                    br = BTREE_RESULT_SUCCESS;
+                } else {
+                    br = BTREE_RESULT_FAIL;
+                }
+            } else {
+                br = seqtreeIterator->prev(&seqnum, (void *)&offset);
+            }
         }
         if (!ver_btreev2_format(iterHandle->file->getVersion())) {
             iterHandle->bhandle->flushBuffer();
@@ -1739,6 +1790,15 @@ fdb_status FdbIterator::iterateSeqNext() {
     if (iterDirection != FDB_ITR_FORWARD) {
         if (iterStatus == FDB_ITR_IDX) {
             iterOffset = BLK_NOT_FOUND; // need to re-examine Trie/trees
+            if (iterHandle->kvs) { // multi KV instance mode
+                // If we need to re-examine the Trie/trees, we must pass in
+                // the last successfully read seqnum from that so direction
+                // change is possible
+                seqnum = _endian_encode(seqNum);
+                kvid2buf(size_id, iterHandle->kvs->getKvsId(), seq_kv);
+                memcpy(seq_kv + size_id, &seqnum, size_seq);
+                seq_kv_len = size_id + size_seq;
+            }
         }
         // re-position WAL key to previous key returned
         if (treeCursorPrev) {
@@ -1768,7 +1828,18 @@ start_seq:
                 br = BTREE_RESULT_FAIL;
             }
         } else {
-            br = seqtreeIterator->next(&seqnum, (void *)&offset);
+            if (ver_btreev2_format(iterHandle->file->getVersion())) {
+                if (seqtreeIteratorV2->nextBT() == BnodeIteratorResult::SUCCESS) {
+                    BtreeKvPair kv_pair = seqtreeIteratorV2->getKvBT();
+                    seqnum = *(static_cast<fdb_seqnum_t *>(kv_pair.key));
+                    offset = *(static_cast<bid_t *>(kv_pair.value));
+                    br = BTREE_RESULT_SUCCESS;
+                } else {
+                    br = BTREE_RESULT_FAIL;
+                }
+            } else {
+                br = seqtreeIterator->next(&seqnum, (void *)&offset);
+            }
         }
         if (!ver_btreev2_format(iterHandle->file->getVersion())) {
             iterHandle->bhandle->flushBuffer();

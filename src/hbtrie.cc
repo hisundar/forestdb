@@ -2497,39 +2497,80 @@ void HBTrie::deallocateBuffer(uint8_t **buf, int index) {
 }
 
 HBTrieIterator::HBTrieIterator() :
-    trie(), curkey(NULL), keylen(0), flags(0)
+    trie(NULL), curkey(NULL), keylen(0), leafChunkno(-1), flags(0)
 {
     list_init(&btreeit_list);
 }
 
 HBTrieIterator::HBTrieIterator(HBTrie* _trie, void *_initial_key, size_t _keylen) :
-    trie(), curkey(NULL), keylen(0), flags(0)
+    trie(NULL), curkey(NULL), keylen(0), leafChunkno(-1), flags(0)
 {
     init(_trie, _initial_key, _keylen);
 }
 
 HBTrieIterator::~HBTrieIterator()
 {
-    struct list_elem *e;
-    struct btreeit_item *item;
+    if (ver_btreev2_format(trie->getFileMgr()->getVersion())) {
+        shrinkBtreeItersTo(-1);
+    } else {
+        struct list_elem *e;
+        struct btreeit_item *item;
 
-    e = list_begin(&btreeit_list);
-    while(e) {
-        item = _get_entry(e, struct btreeit_item, le);
-        e = list_remove(&btreeit_list, e);
-        delete item->btree_it;
-        mempool_free(item);
-    }
-    if (curkey) {
-        free(curkey);
+        e = list_begin(&btreeit_list);
+        while(e) {
+            item = _get_entry(e, struct btreeit_item, le);
+            e = list_remove(&btreeit_list, e);
+            delete item->btree_it;
+            mempool_free(item);
+        }
+        if (curkey) {
+            free(curkey);
+        }
     }
 
     delete trie;
 }
 
+const int HBTrieIterator::initialBtreeIterSize = 8;
+
 hbtrie_result HBTrieIterator::init(HBTrie* _trie, void *_initial_key, size_t _keylen)
 {
     trie = new HBTrie(_trie);
+
+    if (ver_btreev2_format(trie->getFileMgr()->getVersion())) {
+        // Initialize Root Btree Iterator cursor..
+        btreeItrs.resize(initialBtreeIterSize, nullptr);
+        if (_initial_key) {
+            if (greaterOrEqualHBT(trie->getRootAddr(), -1, _initial_key,
+                                  _keylen) != HBTRIE_RESULT_SUCCESS) {
+                flagsSetFailed();
+                flagsSetFwd();
+            } else {
+                // After initial key is located, compare against initial key
+                int cmp = cmpCurKvp(_initial_key, _keylen);
+                if (cmp > 0) {
+                    // If the trie iterator is positioned at a key greater than
+                    // the exact match, then only next() will work as expected.
+                    // Set the direction as FORWARD so that if prev() is
+                    // immediately invoked, we need to do a direction change
+                    // as described in next()
+                    flagsSetFwd();
+                } else if (cmp < 0) {
+                    // If the trie iterator is positioned at a key greater than
+                    // the exact match, then only next() will work as expected.
+                    // Set the direction as FORWARD so that if prev() is
+                    // immediately invoked, we need to do a direction change
+                    // as described in next()
+                    flagsSetRev();
+                }
+            }
+        } else {
+            if (beginHBT(trie->getRootAddr(), -1) != HBTRIE_RESULT_SUCCESS) {
+                flags = 0x0f; // Set all flags to indicate failure
+            }
+        }
+        return HBTRIE_RESULT_SUCCESS;
+    }
 
     curkey = (void *)malloc(HBTRIE_MAX_KEYLEN);
 
@@ -2549,7 +2590,7 @@ hbtrie_result HBTrieIterator::init(HBTrie* _trie, void *_initial_key, size_t _ke
         memset(curkey, 0, trie->getChunkSize());
     }
     list_init(&btreeit_list);
-    flags = 0x0;
+    flags = HBTRIE_ITERATOR_FWD; // set flag to be moving forward.
 
     return HBTRIE_RESULT_SUCCESS;
 }
@@ -2810,29 +2851,6 @@ hbtrie_result HBTrieIterator::_prev(struct btreeit_item *item,
         }
     }
     return HBTRIE_RESULT_FAIL;
-}
-
-hbtrie_result HBTrieIterator::prev(void *key_buf, size_t& keylen_out, void *value_buf)
-{
-    hbtrie_result hr;
-
-    if (flagsIsRev() && flagsIsFailed()) {
-        return HBTRIE_RESULT_FAIL;
-    }
-
-    struct list_elem *e = list_begin(&btreeit_list);
-    struct btreeit_item *item = NULL;
-    if (e) item = _get_entry(e, struct btreeit_item, le);
-
-    hr = _prev(item, key_buf, keylen_out, value_buf, 0x0);
-    flagsSetRev();
-    if (hr == HBTRIE_RESULT_SUCCESS) {
-        flagsClrFailed();
-        flagsSetMoved();
-    } else {
-        flagsSetFailed();
-    }
-    return hr;
 }
 
 hbtrie_result HBTrieIterator::_next(struct btreeit_item *item,
@@ -3110,6 +3128,266 @@ hbtrie_result HBTrieIterator::_next(struct btreeit_item *item,
     return hr;
 }
 
+hbtrie_result HBTrieIterator::nextHBT(int chunkno) {
+    if (chunkno < 0) { // gone past the root, have to return error.
+        return HBTRIE_RESULT_FAIL;
+    }
+    while (!btreeItrs[chunkno]) { // Go past Skipped prefixes
+        if (--chunkno < 0) { // Should never happen, but just in case..
+            return HBTRIE_RESULT_FAIL;
+        }
+    }
+    hbtrie_result hr;
+    do {
+        if (btreeItrs[chunkno]->nextHT() != BnodeIteratorResult::SUCCESS) {
+            if (!chunkno) { // Reached up to root btree and no more entries..
+                return HBTRIE_RESULT_FAIL;
+            }
+            // Release iterator at the current level since it has no more entries
+            shrinkBtreeItersTo(chunkno - 1);
+            // Intermediate Btree but not the root, retry at parent chunk's Btree
+            return nextHBT(chunkno - 1);
+        } // else We found a next entry..
+        hr = HBTRIE_RESULT_SUCCESS;
+        BtreeKvPair curKvp;
+        if (btreeItrs[chunkno]->getKvpHT(&curKvp)) {
+            HBTrieValue hv_from_btree(curKvp.value, curKvp.valuelen);
+            if (hv_from_btree.isSubtree()) {
+                // Reset iterator to current level discarding older paths..
+                shrinkBtreeItersTo(chunkno);
+                // Intermediate Btree has an entry => Go down to it..
+                BtreeNodeAddr nodeAddr(hv_from_btree.getOffset(), nullptr);
+                hr = beginHBT(nodeAddr, chunkno);
+                if (hr == HBTRIE_RESULT_FAIL) { // Sub-tree fully deleted
+                    continue; // Retry operation with next entry
+                }
+                return hr;
+            }
+        }
+    } while (hr == HBTRIE_RESULT_FAIL);
+    // else leaf Chunk Btree..
+    // Release old BtreeIterators after current chunkno until old leafChunkno..
+    shrinkBtreeItersTo(chunkno);
+    return HBTRIE_RESULT_SUCCESS;
+}
+
+hbtrie_result HBTrieIterator::prevHBT(int chunkno) {
+    if (chunkno < 0) { // gone past the root, have to return error.
+        return HBTRIE_RESULT_FAIL;
+    }
+    while (!btreeItrs[chunkno]) { // Go past Skipped prefixes
+        if (--chunkno < 0) { // Should never happen, but just in case..
+            return HBTRIE_RESULT_FAIL;
+        }
+    }
+    hbtrie_result hr;
+    do {
+        if (btreeItrs[chunkno]->prevHT() != BnodeIteratorResult::SUCCESS) {
+            if (!chunkno) { // Reached up to root btree and no more entries..
+                return HBTRIE_RESULT_FAIL;
+            }
+            // Release iterator at the current level since it has no more entries
+            shrinkBtreeItersTo(chunkno - 1);
+            // Intermediate Btree but not the root, retry at parent chunk's Btree
+            return prevHBT(chunkno - 1);
+        }
+        hr = HBTRIE_RESULT_SUCCESS;
+        BtreeKvPair curKvp;
+        if (btreeItrs[chunkno]->getKvpHT(&curKvp)) {
+            HBTrieValue hv_from_btree(curKvp.value, curKvp.valuelen);
+            if (hv_from_btree.isSubtree()) {
+                // Reset iterator to current level discarding older paths..
+                shrinkBtreeItersTo(chunkno);
+                // Intermediate Btree has an entry => Go down to it..
+                BtreeNodeAddr nodeAddr(hv_from_btree.getOffset(), nullptr);
+                hr = endHBT(nodeAddr, chunkno);
+                if (hr == HBTRIE_RESULT_FAIL) { // Sub-tree is fully removed
+                    continue; // Retry operation with previous entry
+                }
+                return hr;
+            }
+        }
+    } while (hr == HBTRIE_RESULT_FAIL);
+
+    // else leaf Chunk Btree..
+    // Release old BtreeIterators after current chunkno until old leafChunkno..
+    shrinkBtreeItersTo(chunkno);
+    return HBTRIE_RESULT_SUCCESS;
+}
+
+hbtrie_result HBTrieIterator::smallerOrEqualHBT(BtreeNodeAddr nodeAddr,
+                                                int prevChunkno,
+                                                void *key, size_t keylen)
+{
+    BnodeIteratorResult result;
+    int chunkno = prevChunkno + 1; // The expected chunk number
+    btree_new_cmp_func *cmp_func;
+    if (trie->isCmpFuncSet() && prevChunkno == 0) { // Set custom cmp
+        BtreeKvPair rootKvp; // if not the root chunk..
+        btreeItrs[0]->getKvpHT(&rootKvp);
+        cmp_func = trie->getCmpFuncForGivenKey(rootKvp.key);
+    } else {
+        cmp_func = nullptr;
+    }
+
+    BtreeIterWrapper *hit = new BtreeIterWrapper(trie, nodeAddr, cmp_func);
+    int realChunkno = hit->getBtreeChunkno();
+    if (realChunkno > chunkno) {
+        // Skipped Prefix, chunkno jumped
+        shrinkBtreeItersTo(prevChunkno);
+    }
+    setBtreeIterAt(realChunkno, hit);
+
+    // Search smaller or equal in current node with current chunk..
+    result = hit->smallerOrEqualHT(key, keylen);
+    if (result != BnodeIteratorResult::SUCCESS) {
+        return HBTRIE_RESULT_FAIL;
+    }
+    BtreeKvPair curKvp;
+    if (hit->getKvpHT(&curKvp)) {
+        HBTrieValue hv_from_btree(curKvp.value, curKvp.valuelen);
+        if (hv_from_btree.isSubtree()) {
+            BtreeNodeAddr nodeAddr(hv_from_btree.getOffset(), nullptr);
+
+            int chunk_offset = (realChunkno - prevChunkno)
+                             * trie->getChunkSize();
+            int keylen_remaining = static_cast<int>(keylen) - chunk_offset;
+            if (keylen_remaining <= 0) {
+                // Case 3: no more keylen remaining for prev btree.
+                // just return last key from sub-btree.
+                return endHBT(nodeAddr, realChunkno);
+            }
+            // Case 0 or 1: Possible exact match or key within sub-btree..
+            uint8_t *key_remaining = reinterpret_cast<uint8_t*>(key)
+                                   + chunk_offset;
+            hbtrie_result hr = smallerOrEqualHBT(nodeAddr, realChunkno,
+                                                 key_remaining,
+                                                 keylen_remaining);
+
+            // Case 2: Key is smaller than smallest key in sub-btree
+            // Simply seek prev lower key in current chunk's btree..
+            if (hr != HBTRIE_RESULT_SUCCESS) {
+                // Reset iterator to current level discarding older paths..
+                shrinkBtreeItersTo(realChunkno);
+                return prevHBT(realChunkno);
+            } else {
+                return hr;
+            }
+        }
+    } // else the cursor is positioned at the key in the prefix section
+    // Leaf Chunk Btree..
+    // Release old BtreeIterators after current chunkno until old leafChunkno..
+    shrinkBtreeItersTo(realChunkno);
+    return HBTRIE_RESULT_SUCCESS;
+}
+
+// Please see 3 Cases in btree_new_test.cc hbtriev2_iterator_test
+// Case 0: Exact match
+// Case 1: Missing key in leaf chunk btree
+// Case 2: Key greater than smaller leaf chunk btree
+// Case 3: Key smaller than smallest leaf chunk btree
+hbtrie_result HBTrieIterator::greaterOrEqualHBT(BtreeNodeAddr nodeAddr,
+                                                int prevChunkno,
+                                                void *key, size_t keylen)
+{
+    BnodeIteratorResult result;
+    int chunkno = prevChunkno + 1; // The expected chunk number
+    btree_new_cmp_func *cmp_func;
+    if (trie->isCmpFuncSet() && prevChunkno == 0) { // Set custom cmp
+        BtreeKvPair rootKvp; // if not the root chunk..
+        btreeItrs[0]->getKvpHT(&rootKvp);
+        cmp_func = trie->getCmpFuncForGivenKey(rootKvp.key);
+    } else {
+        cmp_func = nullptr;
+    }
+
+    BtreeIterWrapper *hit = new BtreeIterWrapper(trie, nodeAddr, cmp_func);
+    int realChunkno = hit->getBtreeChunkno();
+    if (realChunkno > chunkno) {
+        // Skipped Prefix, chunkno jumped
+        shrinkBtreeItersTo(prevChunkno);
+    }
+    setBtreeIterAt(realChunkno, hit);
+
+    // Search greater or equal in current node with current chunk..
+    result = hit->greaterOrEqualHT(key, keylen);
+    if (result != BnodeIteratorResult::SUCCESS) {
+        return HBTRIE_RESULT_FAIL;
+    }
+    BtreeKvPair curKvp;
+    if (hit->getKvpHT(&curKvp)) {
+        HBTrieValue hv_from_btree(curKvp.value, curKvp.valuelen);
+        if (hv_from_btree.isSubtree()) {
+            BtreeNodeAddr nodeAddr(hv_from_btree.getOffset(), nullptr);
+
+            int chunk_offset = (realChunkno - prevChunkno)
+                             * trie->getChunkSize();
+            int keylen_remaining = static_cast<int>(keylen) - chunk_offset;
+            if (keylen_remaining <= 0) {
+                // Case 3: no more keylen remaining for next btree.
+                // just return first key from sub-btree.
+                return beginHBT(nodeAddr, realChunkno);
+            }
+            // Case 0 or 1: Possible exact match or key within sub-btree..
+            uint8_t *key_remaining = reinterpret_cast<uint8_t*>(key)
+                                   + chunk_offset;
+            hbtrie_result hr = greaterOrEqualHBT(nodeAddr, realChunkno,
+                                                 key_remaining,
+                                                 keylen_remaining);
+
+            // Case 2: Key is greater than greatest key in sub-btree
+            // Simply seek next higher key in current chunk's btree..
+            if (hr != HBTRIE_RESULT_SUCCESS) {
+                // Reset iterator to current level discarding older paths..
+                shrinkBtreeItersTo(realChunkno);
+                return nextHBT(realChunkno);
+            } else {
+                return hr;
+            }
+        }
+    } // else the cursor is positioned at the key in the prefix section
+    // Leaf Chunk Btree..
+    // Release old BtreeIterators after current chunkno until old leafChunkno..
+    shrinkBtreeItersTo(realChunkno);
+    return HBTRIE_RESULT_SUCCESS;
+}
+
+
+hbtrie_result HBTrieIterator::nextValueOnly(void *value_buf)
+{
+    size_t keylen_temp = 0;
+    hbtrie_result hr;
+
+    if (flagsIsFailed()) {
+        return HBTRIE_RESULT_FAIL;
+    }
+
+    if (ver_btreev2_format(trie->getFileMgr()->getVersion())) {
+        hr = HBTRIE_RESULT_SUCCESS; // since flagsIsFailed is not set
+        // First copy out the value at the current iterator position
+        copyCurKvp(NULL, keylen_temp, value_buf);
+        if (nextHBT(leafChunkno) != HBTRIE_RESULT_SUCCESS) {
+            flagsSetFailed(); // return error on next next() call
+        }
+    } else {
+        if (curkey == NULL) {
+            return HBTRIE_RESULT_FAIL;
+        }
+
+        struct list_elem *e = list_begin(&btreeit_list);
+        struct btreeit_item *item = NULL;
+        if (e) item = _get_entry(e, struct btreeit_item, le);
+
+        hr = _next(item, NULL, keylen_temp, value_buf, HBTRIE_PREFIX_MATCH_ONLY);
+        if (hr != HBTRIE_RESULT_SUCCESS) {
+            // this iterator reaches the end of hb-trie
+            free(curkey);
+            curkey = NULL;
+        }
+    }
+    return hr;
+}
+
 hbtrie_result HBTrieIterator::next(void *key_buf,
                                    size_t& keylen_out,
                                    void *value_buf)
@@ -3120,40 +3398,123 @@ hbtrie_result HBTrieIterator::next(void *key_buf,
         return HBTRIE_RESULT_FAIL;
     }
 
-    struct list_elem *e = list_begin(&btreeit_list);
-    struct btreeit_item *item = NULL;
-    if (e) item = _get_entry(e, struct btreeit_item, le);
-
-    hr = _next(item, key_buf, keylen_out, value_buf, 0x0);
-    flagsSetFwd();
-    if (hr == HBTRIE_RESULT_SUCCESS) {
-        flagsClrFailed();
-        flagsSetMoved();
+    if (ver_btreev2_format(trie->getFileMgr()->getVersion())) {
+        if (flagsIsRev()) { // Need to change direction before returning key..
+            if (flagsIsFailed()) { // If last operation failed, need to re-init
+                shrinkBtreeItersTo(-1);
+                if (greaterOrEqualHBT(trie->getRootAddr(), -1, key_buf,
+                                      keylen_out) != HBTRIE_RESULT_SUCCESS) {
+                    flags = 0x0f; // Set all flags to indicate failure
+                    return HBTRIE_RESULT_FAIL;
+                }
+            } else {
+                // The iterator's cursor is one step ahead of the last
+                // returned key. But only if it has moved.
+                // For example, when iterator is initialized to 3
+                //   1   2   3   4   5
+                //           ^
+                //            `--- cursor
+                // Now if prev() was called 3 is returned and cursor is ready at 2
+                //   1   2   3   4   5
+                //       ^   ^
+                //        \   `---- last key returned
+                //         `---cursor
+                // So only on change of direction (and not on init) we must move
+                // cursor twice in the desired direction..
+                if (nextHBT(leafChunkno) != HBTRIE_RESULT_SUCCESS ||
+                   (flagsIsMoved() && // Cursor was moved before and not at init
+                    nextHBT(leafChunkno) != HBTRIE_RESULT_SUCCESS)) {
+                    flagsSetFailed(); // return error on next next() call
+                    return HBTRIE_RESULT_FAIL;
+                }
+            }
+        }
+        hr = HBTRIE_RESULT_SUCCESS; // since flag is not fail
+        // First copy current Key position out..
+        copyCurKvp(key_buf, keylen_out, value_buf);
+        flagsSetFwd();
+        if (nextHBT(leafChunkno) != HBTRIE_RESULT_SUCCESS) {
+            flagsSetFailed(); // return error on next next() call
+        } else {
+            flagsClrFailed();
+            flagsSetMoved();
+        }
     } else {
-        flagsSetFailed();
+        struct list_elem *e = list_begin(&btreeit_list);
+        struct btreeit_item *item = NULL;
+        if (e) item = _get_entry(e, struct btreeit_item, le);
+
+        hr = _next(item, key_buf, keylen_out, value_buf, 0x0);
+        flagsSetFwd();
+        if (hr == HBTRIE_RESULT_SUCCESS) {
+            flagsClrFailed();
+            flagsSetMoved();
+        } else {
+            flagsSetFailed();
+        }
     }
     return hr;
-
 }
 
-hbtrie_result HBTrieIterator::nextValueOnly(void *value_buf)
+hbtrie_result HBTrieIterator::prev(void *key_buf, size_t& keylen_out, void *value_buf)
 {
-    size_t keylen_temp = 0;
     hbtrie_result hr;
 
-    if (curkey == NULL) {
+    if (flagsIsRev() && flagsIsFailed()) {
         return HBTRIE_RESULT_FAIL;
     }
+    if (ver_btreev2_format(trie->getFileMgr()->getVersion())) {
+        if (flagsIsFwd()) {
+            if (flagsIsFailed()) { // If next went past last key, must init
+                shrinkBtreeItersTo(-1);
+                if (smallerOrEqualHBT(trie->getRootAddr(), -1, key_buf,
+                        keylen_out) != HBTRIE_RESULT_SUCCESS) {
+                    flags = 0x0f; // Set all flags to indicate failure
+                    return HBTRIE_RESULT_FAIL;
+                }
+                if (!cmpCurKvp(key_buf, keylen_out)) {
+                    // If the next had successfully returned a key before..
+                    // On direction change we must shift to its previous key..
+                    if (prevHBT(leafChunkno) != HBTRIE_RESULT_SUCCESS) {
+                        flagsSetFailed();
+                        return HBTRIE_RESULT_FAIL;
+                    }
+                }
+                flagsClrFailed();
+            } else {
+                // Need to change direction before returning key..
+                // Please refer to comments in ::next() above
+                if (prevHBT(leafChunkno) != HBTRIE_RESULT_SUCCESS ||
+                    (flagsIsMoved() && // cursor was moved before and not at init.
+                     prevHBT(leafChunkno) != HBTRIE_RESULT_SUCCESS)) {
+                    flagsSetFailed(); // return error on next next() call
+                    return HBTRIE_RESULT_FAIL;
+                }
+            }
+        }
+        hr = HBTRIE_RESULT_SUCCESS; // since previous flag is not fail
+        // First copy current Key position out..
+        copyCurKvp(key_buf, keylen_out, value_buf);
+        flagsSetRev();
+        if (prevHBT(leafChunkno) != HBTRIE_RESULT_SUCCESS) {
+            flagsSetFailed(); // return error on next next() call
+        } else {
+            flagsClrFailed();
+            flagsSetMoved();
+        }
+    } else {
+        struct list_elem *e = list_begin(&btreeit_list);
+        struct btreeit_item *item = NULL;
+        if (e) item = _get_entry(e, struct btreeit_item, le);
 
-    struct list_elem *e = list_begin(&btreeit_list);
-    struct btreeit_item *item = NULL;
-    if (e) item = _get_entry(e, struct btreeit_item, le);
-
-    hr = _next(item, NULL, keylen_temp, value_buf, HBTRIE_PREFIX_MATCH_ONLY);
-    if (hr != HBTRIE_RESULT_SUCCESS) {
-        // this iterator reaches the end of hb-trie
-        free(curkey);
-        curkey = NULL;
+        hr = _prev(item, key_buf, keylen_out, value_buf, 0x0);
+        flagsSetRev();
+        if (hr == HBTRIE_RESULT_SUCCESS) {
+            flagsClrFailed();
+            flagsSetMoved();
+        } else {
+            flagsSetFailed();
+        }
     }
     return hr;
 }
@@ -3162,6 +3523,17 @@ hbtrie_result HBTrieIterator::nextValueOnly(void *value_buf)
 // hbtrie_prev() call after hbtrie_last() will return the last key.
 hbtrie_result HBTrieIterator::last()
 {
+    if (ver_btreev2_format(trie->getFileMgr()->getVersion())) {
+        shrinkBtreeItersTo(-1);
+        if (endHBT(trie->getRootAddr(), -1)) {
+            flagsSetFailed();
+            return HBTRIE_RESULT_FAIL;
+        } else {
+            flagsClrFailed();
+        }
+        flagsSetRev();
+        return HBTRIE_RESULT_SUCCESS;
+    }
     // free btreeit_list
     struct list_elem *e;
     struct btreeit_item *item;
@@ -3185,8 +3557,413 @@ hbtrie_result HBTrieIterator::last()
     keylen = trie->getChunkSize();
 
     list_init(&btreeit_list);
-    flags = 0x0;
+    flags = HBTRIE_ITERATOR_FWD;
 
     return HBTRIE_RESULT_SUCCESS;
 }
 
+hbtrie_result HBTrieIterator::copyCurKvp(void *key_out,
+                                         size_t &keylen_out, void *value_buf)
+{
+    BtreeKvPair curKvp;
+    btreeItrs[leafChunkno]->getKvpHT(&curKvp);
+    HBTrieValue hv_from_btree(curKvp.value, curKvp.valuelen);
+    hv_from_btree.toBinaryWithoutFlags(value_buf);
+    if (!key_out) { // only value is required
+        return HBTRIE_RESULT_SUCCESS;
+    }
+    uint8_t *key_buf = static_cast<uint8_t *>(key_out);
+    size_t keylen = 0;
+    for (int chunkno = 0; chunkno <= leafChunkno; ++chunkno) {
+        if (!btreeItrs[chunkno]) {
+            continue; // skipped prefix..
+        }
+        if (btreeItrs[chunkno]->getCommonPrefix(&curKvp)) {
+            // Skipped common prefix exists first copy out that prefix..
+            size_t skipped_len = curKvp.keylen;
+            if (skipped_len) {
+                uint8_t *skipped_chunk = static_cast<uint8_t*>(curKvp.key);
+                memcpy(key_buf, skipped_chunk, skipped_len);
+                keylen += skipped_len; // record the keylen copied so far
+                key_buf += skipped_len; // advance key cursor
+            }
+        }
+        // Now copy the key portion from the BtreeIterator
+        btreeItrs[chunkno]->getKvpHT(&curKvp);
+        memcpy(key_buf, curKvp.key, curKvp.keylen); // copy out key
+        keylen += curKvp.keylen; // record the keylen copied so far
+        key_buf += curKvp.keylen; // advance key cursor
+    }
+    keylen_out = keylen;
+    return HBTRIE_RESULT_SUCCESS;
+}
+
+int HBTrieIterator::cmpCurKvp(void *key, int keylen)
+{
+    uint8_t *key_buf = static_cast<uint8_t *>(key);
+    int cmp = 0;
+    int chunksize = trie->getChunkSize();
+    int chunkno = 0;
+    BtreeKvPair curKvp;
+    for (;chunkno <= leafChunkno && keylen > 0; ++chunkno) {
+        if (!btreeItrs[chunkno]) {
+            continue; // skipped prefix..
+        }
+        if (btreeItrs[chunkno]->getCommonPrefix(&curKvp)) {
+            // Skipped common prefix exists
+            size_t skipped_len = curKvp.keylen;
+            if (skipped_len) {
+                uint8_t *skipped_chunk = static_cast<uint8_t*>(curKvp.key);
+                size_t minlen = std::min(static_cast<size_t>(keylen),
+                                         skipped_len);
+                cmp = lex_key_cmp(key_buf, minlen, skipped_chunk, skipped_len);
+                if (cmp) { // Mismatch found in prefix need not compare rest
+                    return cmp;
+                }
+                keylen -= skipped_len;
+                key_buf += skipped_len; // advance key cursor
+            }
+        }
+        btreeItrs[chunkno]->getKvpHT(&curKvp);
+        size_t minlen = std::min(keylen, chunksize);
+        cmp = lex_key_cmp(curKvp.key, curKvp.keylen, key_buf, minlen);
+        if (cmp) { // Mismatch found..
+            return cmp;
+        }
+        keylen -= curKvp.keylen;
+        key_buf += curKvp.keylen;
+    }
+    if (!keylen) {
+        return 0;
+    }
+    if (chunkno <= leafChunkno) { // key at cursor larger than given key
+        return 1;
+    }
+    if (keylen) { // key at cursor is smaller than given key
+        return -1;
+    }
+    return 0;
+}
+
+void HBTrieIterator::setBtreeIterAt(int chunkno, BtreeIterWrapper *hit) {
+    if (btreeItrs.capacity() < static_cast<size_t>(chunkno) + 1) {
+        btreeItrs.resize(chunkno + 1, nullptr);
+    }
+    fdb_assert(btreeItrs[chunkno] != hit, hit, btreeItrs[chunkno]);
+    delete btreeItrs[chunkno];
+    btreeItrs[chunkno] = hit;
+}
+
+void HBTrieIterator::shrinkBtreeItersTo(int chunkno)
+{
+    for (int idx = leafChunkno; idx > chunkno; --idx) {
+        delete btreeItrs[idx];
+        btreeItrs[idx] = nullptr;
+    }
+    leafChunkno = chunkno;
+}
+
+hbtrie_result HBTrieIterator::beginHBT(BtreeNodeAddr nodeAddr, int prevChunkno)
+{
+    BnodeIteratorResult result;
+    int chunkno = prevChunkno + 1; // The expected chunk number
+    btree_new_cmp_func *cmp_func;
+    if (trie->isCmpFuncSet() && prevChunkno == 0) {
+        // If previous chunk was root B+tree,
+        // set custom cmp function if exists.
+        // Note that root B+tree does not use custom cmp function,
+        // since it stores KVS ID which always should be in a
+        // lexicographical order.
+        BtreeKvPair rootKvp;
+        btreeItrs[0]->getKvpHT(&rootKvp);
+        cmp_func = trie->getCmpFuncForGivenKey(rootKvp.key);
+    } else {
+        cmp_func = nullptr;
+    }
+
+    BtreeIterWrapper *hit = new BtreeIterWrapper(trie, nodeAddr, cmp_func);
+    int realChunkno = hit->getBtreeChunkno();
+    if (realChunkno > chunkno) {
+        // Skipped Prefix, chunkno jumped
+        shrinkBtreeItersTo(prevChunkno);
+    }
+    setBtreeIterAt(realChunkno, hit);
+
+    // Go To The First Entry in this Btree...
+    result = hit->beginHT();
+    if (result != BnodeIteratorResult::SUCCESS) {
+        return HBTRIE_RESULT_FAIL;
+    }
+    BtreeKvPair curKvp;
+    if (hit->getKvpHT(&curKvp)) {
+        HBTrieValue hv_from_btree(curKvp.value, curKvp.valuelen);
+        if (hv_from_btree.isSubtree()) {
+            BtreeNodeAddr nodeAddr(hv_from_btree.getOffset(), nullptr);
+            return beginHBT(nodeAddr, chunkno);
+        }
+    } // else the cursor is positioned at the key in the prefix section
+
+    // Leaf Chunk Btree..
+    // Release old BtreeIterators after current chunkno until old leafChunkno..
+    shrinkBtreeItersTo(realChunkno);
+    return HBTRIE_RESULT_SUCCESS;
+}
+
+hbtrie_result HBTrieIterator::endHBT(BtreeNodeAddr nodeAddr, int prevChunkno)
+{
+    BnodeIteratorResult result;
+    int chunkno = prevChunkno + 1; // The expected chunk number
+    btree_new_cmp_func *cmp_func;
+    if (trie->isCmpFuncSet() && prevChunkno == 0) {
+        // If previous chunk was root B+tree,
+        // set custom cmp function if exists.
+        // Note that root B+tree does not use custom cmp function,
+        // since it stores KVS ID which always should be in a
+        // lexicographical order.
+        BtreeKvPair rootKvp;
+        btreeItrs[0]->getKvpHT(&rootKvp);
+        cmp_func = trie->getCmpFuncForGivenKey(rootKvp.key);
+    } else {
+        cmp_func = nullptr;
+    }
+
+    BtreeIterWrapper *hit = new BtreeIterWrapper(trie, nodeAddr, cmp_func);
+    int realChunkno = hit->getBtreeChunkno();
+    if (realChunkno > chunkno) {
+        // Skipped Prefix, chunkno jumped
+        shrinkBtreeItersTo(prevChunkno);
+    }
+    setBtreeIterAt(realChunkno, hit);
+
+    // Go To The Last Entry in this Btree...
+    result = hit->endHT();
+    if (result != BnodeIteratorResult::SUCCESS) {
+        return HBTRIE_RESULT_FAIL;
+    }
+    BtreeKvPair curKvp;
+    if (hit->getKvpHT(&curKvp)) {
+        HBTrieValue hv_from_btree(curKvp.value, curKvp.valuelen);
+        if (hv_from_btree.isSubtree()) {
+            BtreeNodeAddr nodeAddr(hv_from_btree.getOffset(), nullptr);
+            return endHBT(nodeAddr, chunkno);
+        }
+    } // else the cursor is positioned at the key in the prefix section
+
+    // Leaf Chunk Btree..
+    // Release old BtreeIterators after current chunkno until old leafChunkno..
+    shrinkBtreeItersTo(realChunkno);
+    return HBTRIE_RESULT_SUCCESS;
+}
+
+BtreeIterWrapper::BtreeIterWrapper(HBTrie *_trie, BtreeNodeAddr rootAddr,
+                                   btree_new_cmp_func *cmp_func)
+{
+    trie = _trie;
+    isKeyInMeta = false;
+    BtreeV2 *curBtree = new BtreeV2();
+    curBtree->setBMgr(trie->getBnodeMgr());
+    curBtree->setCmpFunc(cmp_func);
+    BtreeV2Result br = curBtree->initFromAddr(rootAddr);
+    if (br != BtreeV2Result::SUCCESS) {
+        delete curBtree;
+        fdb_assert(false, rootAddr.offset, _trie);
+    }
+    btreeItr = new BtreeIteratorV2(curBtree);
+}
+
+BtreeIterWrapper::~BtreeIterWrapper() {
+    BtreeV2 *curBtree = btreeItr->getBtree();
+    delete btreeItr;
+    delete curBtree;
+    btreeItr = nullptr;
+    trie = nullptr;
+}
+
+void BtreeIterWrapper::readHBMeta(struct hbtrie_meta *hbmeta) {
+    BtreeV2 *curBtree = btreeItr->getBtree();
+    BtreeV2Meta bmeta;
+    curBtree->getMeta(bmeta);
+    trie->fetchMeta(bmeta.size, hbmeta, bmeta.ctx);
+}
+
+bool BtreeIterWrapper::getCommonPrefix(BtreeKvPair *retKvp) {
+    struct hbtrie_meta hbmeta;
+    readHBMeta(&hbmeta);
+    if (hbmeta.prefix_len) {
+        retKvp->key = hbmeta.prefix;
+        retKvp->keylen = hbmeta.prefix_len;
+        retKvp->value = hbmeta.value;
+        retKvp->valuelen = trie->getValueLen();
+        return true;
+    }
+    return false;
+}
+
+bool BtreeIterWrapper::getKvpHT(BtreeKvPair *retKvp) {
+    if (isKeyInMeta) { // Cursor pointing to key in meta section
+        getCommonPrefix(retKvp);
+        return false;
+    }
+    *retKvp = btreeItr->getKvBT();
+    return true;
+}
+
+int BtreeIterWrapper::getBtreeChunkno() {
+    // Find out which chunk this Btree is at by reading meta section...
+    struct hbtrie_meta hbmeta;
+    readHBMeta(&hbmeta);
+    return hbmeta.chunkno;
+}
+
+BnodeIteratorResult BtreeIterWrapper::beginHT() {
+    if (isKeyInMeta) { // Already pointing to prefix key
+        return BnodeIteratorResult::SUCCESS;
+    }
+    struct hbtrie_meta hbmeta;
+    readHBMeta(&hbmeta);
+    if (hbmeta.value) { // Key present in the prefix section..
+        isKeyInMeta = true;
+        btreeItr->beginBT(); // set iterator to lowest key
+        return BnodeIteratorResult::SUCCESS;
+    }
+    // No key inside prefix, return first key of BtreeIterator..
+    return btreeItr->beginBT();
+}
+
+BnodeIteratorResult BtreeIterWrapper::nextHT() {
+    if (isKeyInMeta) {
+        // First iterator movement is simply to the actual BtreeIteratorV2
+        isKeyInMeta = false;
+        return BnodeIteratorResult::SUCCESS;
+    }
+    return btreeItr->nextBT();
+}
+
+BnodeIteratorResult BtreeIterWrapper::prevHT() {
+    if (isKeyInMeta) { // Already positioned at start, no more entry
+        return BnodeIteratorResult::NO_MORE_ENTRY;
+    }
+    // First check Btree Iterator..
+    if (btreeItr->prevBT() != BnodeIteratorResult::SUCCESS) {
+        struct hbtrie_meta hbmeta;
+        readHBMeta(&hbmeta);
+        if (hbmeta.value) { // Position cursor to key in meta section..
+            isKeyInMeta = true;
+            return BnodeIteratorResult::SUCCESS;
+        }
+        return BnodeIteratorResult::NO_MORE_ENTRY;
+    }
+    return BnodeIteratorResult::SUCCESS;
+}
+
+BnodeIteratorResult BtreeIterWrapper::endHT() {
+    // First check Btree Iterator..
+    if (btreeItr->endBT() != BnodeIteratorResult::SUCCESS) {
+        struct hbtrie_meta hbmeta;
+        readHBMeta(&hbmeta);
+        if (hbmeta.value) { // Position cursor to key in meta section..
+            isKeyInMeta = true;
+            return BnodeIteratorResult::SUCCESS;
+        }
+        return BnodeIteratorResult::NO_MORE_ENTRY;
+    }
+    return BnodeIteratorResult::SUCCESS;
+}
+
+/**
+ * We have the following cases, based on where the seek key is positioned..
+ *       [A,   X]
+ *      /        \
+ * [ |  C]   [   Y  |  Z]
+ * (1) (2)   (3)(4) (5)
+ */
+BnodeIteratorResult BtreeIterWrapper::greaterOrEqualHT(void *key,
+                                                       size_t keylen) {
+    if (trie->isCmpFuncSet()) {
+        // If custom compare function is set, there can be no doc in the
+        // HB+Trie Meta section. So directly hand over seek to BTreeIteratorV2
+        return btreeItr->seekGreaterOrEqualBT(key, keylen);
+    }
+    struct hbtrie_meta hbmeta;
+    readHBMeta(&hbmeta);
+    if (keylen == 0) { // No more suffix of the key to compare, return begin
+        // Case 1:
+        if (hbmeta.value) { // If doc present in meta section, point to it..
+            isKeyInMeta = true;
+            btreeItr->beginBT();
+            return BnodeIteratorResult::SUCCESS;
+        }
+        return btreeItr->beginBT();
+    } // else suffix length is non-zero..
+    if (hbmeta.prefix_len) { // we have a non-zero prefix section
+        size_t prefix_to_cmp = std::min(static_cast<size_t>(hbmeta.prefix_len),
+                                        keylen);
+        int prefix_cmp = lex_key_cmp(key, prefix_to_cmp, hbmeta.prefix,
+                                     hbmeta.prefix_len);
+        if (prefix_cmp < 0 || // Seek key smaller than doc in suffix section..
+            (!prefix_cmp && // Exact match with prefix in meta section AND
+             keylen == hbmeta.prefix_len)) { // seek key == skipped prefix
+            if (hbmeta.value) { // Case 3
+                isKeyInMeta = true;
+                btreeItr->beginBT();
+                return BnodeIteratorResult::SUCCESS;
+            }
+            return btreeItr->beginBT(); // Case 4
+        } // else fall through default suffix key comparison of chunk size..
+    } // Case 2, 5
+    uint8_t *suffix_key = reinterpret_cast<uint8_t *>(key) + hbmeta.prefix_len;
+    keylen = std::min(static_cast<size_t>(trie->getChunkSize()), keylen);
+    keylen -= hbmeta.prefix_len;
+    return btreeItr->seekGreaterOrEqualBT(suffix_key, keylen);
+}
+
+/**
+ * We have the following cases, based on where the seek key is positioned..
+ *       [A,   X]
+ *      /        \
+ * [ |  C]   [   Y  |  Z]
+ * (1) (2)   (3)(4) (5)
+ */
+BnodeIteratorResult BtreeIterWrapper::smallerOrEqualHT(void *key,
+                                                       size_t keylen) {
+    if (trie->isCmpFuncSet()) {
+        // If custom compare function is set, there can be no doc in the
+        // HB+Trie Meta section. So directly hand over seek to BTreeIteratorV2
+        return btreeItr->seekSmallerOrEqualBT(key, keylen);
+    }
+    struct hbtrie_meta hbmeta;
+    readHBMeta(&hbmeta);
+    if (keylen == 0) { // No more suffix of the key to compare, return largest
+        // Case 1:
+        BnodeIteratorResult ret = btreeItr->endBT();
+        if (ret != BnodeIteratorResult::SUCCESS) {
+            if (hbmeta.value) { // If doc present in meta section, point to it..
+                isKeyInMeta = true;
+                ret = BnodeIteratorResult::SUCCESS;
+            }
+        }
+        return ret;
+    } // else suffix length is non-zero..
+    if (hbmeta.prefix_len) { // we have a non-zero prefix section
+        size_t prefix_to_cmp = std::min(static_cast<size_t>(hbmeta.prefix_len),
+                                        keylen);
+        int prefix_cmp = lex_key_cmp(key, prefix_to_cmp, hbmeta.prefix,
+                                     hbmeta.prefix_len);
+        if (prefix_cmp < 0) { // Seek key smaller than doc in suffix section..
+            return BnodeIteratorResult::NO_MORE_ENTRY;
+        }
+        if ((!prefix_cmp && // Exact match with prefix in meta section AND
+             keylen == hbmeta.prefix_len)) { // seek key == skipped prefix
+            if (hbmeta.value) { // Case 3
+                isKeyInMeta = true;
+                btreeItr->beginBT();
+                return BnodeIteratorResult::SUCCESS;
+            } // else skipped prefix matches, but no key that ends with it..
+            return btreeItr->beginBT(); // Case 4
+        } // else fall through default suffix key comparison of chunk size..
+    } // Case 2, 5
+    uint8_t *suffix_key = reinterpret_cast<uint8_t *>(key) + hbmeta.prefix_len;
+    keylen = std::min(static_cast<size_t>(trie->getChunkSize()), keylen);
+    keylen -= hbmeta.prefix_len;
+    return btreeItr->seekSmallerOrEqualBT(suffix_key, keylen);
+}
