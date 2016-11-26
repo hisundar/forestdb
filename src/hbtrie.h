@@ -49,6 +49,7 @@ struct hbtrie_meta {
 
     chunkno_t chunkno;
     uint16_t prefix_len;
+    uint8_t value_len;
     void *value;
     void *prefix;
 };
@@ -101,41 +102,64 @@ class FileMgr;
 class BnodeMgr;
 
 
-// Flag that HBTrieValue points to a document.
-#define HV_DOC (0x0)
-// Flag that HBTrieValue points to a sub B+tree.
+// Flag that HBTrieValue contains a sub B+tree root offset.
 #define HV_SUB_TREE (0x80)
 // Flag that root node of sub B+tree is dirty.
 #define HV_DIRTY_ROOT (0x40)
+// Flag that HBTrieValue contains a variable-length data,
+// which is greater than 8 bytes.
+#define HV_VLEN_DATA (0x20)
+// Flag that HBTrieValue contains a document offset.
+#define HV_DOC (0x0)
 
 /**
- * 9-byte structure for HB+trie internal value.
+ * Wrapper for HB+trie internal value.
  *
- * it can point to
- *   document offset             (flags == 0x0)
- *   clean root node of sub-tree (flags == 0x80)
- *   dirty root node of sub-tree (flags == 0x80 | 0x40)
+ * it can contain
+ *   document offset                     (flags == 0x00)
+ *   document metadata                   (flags == 0x00 | 0x20)
+ *   clean root node offset of sub-tree  (flags == 0x80)
+ *   dirty root node pointer of sub-tree (flags == 0x80 | 0x40)
  */
 class HBTrieValue {
 public:
     // default constructor
     HBTrieValue() :
-        flags(0x0), offset(0x0) { }
+        flags(0x0), valueLen(0), offset(0x0), binary(nullptr) { }
 
     // directly assign offset integer and flags
     HBTrieValue(uint8_t _flags, uint64_t _offset) :
-        flags(_flags), offset(_offset) { }
+        flags(_flags), valueLen(sizeof(offset)),
+        offset(_offset), binary(nullptr) { }
 
     // assign offset from (encoded) binary data given by caller
-    HBTrieValue(uint8_t _flags, void *value_8bytes) :
-        flags(_flags)
+    HBTrieValue(uint8_t _flags, void *enc_offset_from_caller) :
+        flags(_flags), valueLen(sizeof(offset)), binary(nullptr)
     {
-        offset = *(reinterpret_cast<uint64_t*>(value_8bytes));
+        offset = *(reinterpret_cast<uint64_t*>(enc_offset_from_caller));
         offset = _endian_decode(offset);
     }
 
+    // assign variable-length value data given by caller
+    HBTrieValue(uint8_t _flags,
+                void *value_from_caller,
+                size_t value_len_from_caller) :
+        flags(_flags), valueLen(sizeof(offset)), binary(nullptr)
+    {
+        if (flags & HV_VLEN_DATA) {
+            // variable-length binary data
+            binary = value_from_caller;
+            valueLen = value_len_from_caller;
+        } else {
+            // otherwise: 8-byte offset
+            offset = *(reinterpret_cast<uint64_t*>(value_from_caller));
+            offset = _endian_decode(offset);
+        }
+    }
+
     // assign offset (or pointer) using node addr info
-    HBTrieValue(BtreeNodeAddr _addr) {
+    HBTrieValue(BtreeNodeAddr _addr) :
+        valueLen(sizeof(offset)), binary(nullptr) {
         flags = HV_SUB_TREE;
         if (_addr.isDirty) {
             // dirty node (store pointer address)
@@ -148,11 +172,28 @@ public:
     }
 
     // parse & import flag & offset from existing raw HB+trie binary
-    HBTrieValue(void* value_9bytes) {
-        uint8_t *ptr = reinterpret_cast<uint8_t*>(value_9bytes);
+    HBTrieValue(void* value_from_hbtrie) :
+        valueLen(sizeof(offset)), binary(nullptr) {
+        uint8_t *ptr = reinterpret_cast<uint8_t*>(value_from_hbtrie);
         flags = *ptr;
-        offset = *( reinterpret_cast<uint64_t*>(ptr+1) );
+        offset = *( reinterpret_cast<uint64_t*>(ptr+sizeof(flags)) );
         offset = _endian_decode(offset);
+    }
+
+    // parse & import variable-length data from raw HB+trie binary
+    HBTrieValue(void* value_from_hbtrie, size_t value_len_from_hbtrie) :
+        valueLen(sizeof(offset)), offset(0), binary(nullptr) {
+        uint8_t *ptr = reinterpret_cast<uint8_t*>(value_from_hbtrie);
+        flags = *ptr;
+        if (flags & HV_VLEN_DATA) {
+            // variable-length data
+            valueLen = value_len_from_hbtrie - sizeof(flags);
+            binary = ptr + sizeof(flags);
+        } else {
+            // offset
+            offset = *( reinterpret_cast<uint64_t*>(ptr+sizeof(flags)) );
+            offset = _endian_decode(offset);
+        }
     }
 
     // export to raw binary including flags
@@ -162,20 +203,31 @@ public:
             return nullptr;
         }
         uint8_t *ptr8 = static_cast<uint8_t*>(buf);
-        uint64_t *ptr64 = reinterpret_cast<uint64_t*>(ptr8+1);
-        *ptr64 = _endian_encode(offset);
         *ptr8 = flags;
+        if (flags & HV_VLEN_DATA) {
+            memcpy(ptr8+sizeof(flags), binary, valueLen);
+        } else {
+            // offset
+            uint64_t *ptr64 = reinterpret_cast<uint64_t*>(ptr8+sizeof(flags));
+            *ptr64 = _endian_encode(offset);
+        }
         return buf;
     }
 
     // export to raw binary excluding flags
     // (8 bytes, for return value outside HB+trie)
-    void *toBinaryOffsetOnly(void *buf) {
+    void *toBinaryWoFlags(void *buf) {
         if (!buf) {
             return nullptr;
         }
-        uint64_t *ptr64 = reinterpret_cast<uint64_t*>(buf);
-        *ptr64 = _endian_encode(offset);
+        if (flags & HV_VLEN_DATA) {
+            // variable-length data
+            memcpy(buf, binary, valueLen);
+        } else {
+            // 8-byte offset
+            uint64_t *ptr64 = reinterpret_cast<uint64_t*>(buf);
+            *ptr64 = _endian_encode(offset);
+        }
         return buf;
     }
 
@@ -187,6 +239,10 @@ public:
         return flags & HV_DIRTY_ROOT;
     }
 
+    bool isVlenData() {
+        return flags & HV_VLEN_DATA;
+    }
+
     uint64_t getOffset() const {
         return offset;
     }
@@ -194,11 +250,22 @@ public:
         return reinterpret_cast<Bnode*>(offset);
     }
 
+    size_t size() const {
+        return sizeof(flags)+valueLen;
+    }
+    size_t sizeWoFlags() const {
+        return valueLen;
+    }
+
 private:
     // Flags
     uint8_t flags;
+    // Value length (8 bytes if value is offset or pointer);
+    uint8_t valueLen;
     // Offset (or pointer) to document or child B+tree.
     uint64_t offset;
+    // Variable-length binary data if value is not an offset.
+    void *binary;
 };
 
 
@@ -433,6 +500,8 @@ public:
     int reformKeyReverse(void *key, int keylen);
 
     hbtrie_result find(void *rawkey, int rawkeylen, void *valuebuf);
+    hbtrie_result find_vlen(void *rawkey, int rawkeylen,
+                            void *valuebuf, size_t *value_len_out);
     hbtrie_result findOffset(void *rawkey, int rawkeylen, void *valuebuf);
     hbtrie_result findPartial(void *rawkey, int rawkeylen, void *valuebuf);
 
@@ -441,6 +510,12 @@ public:
 
     hbtrie_result insert(void *rawkey, int rawkeylen,
                          void *value, void *oldvalue_out);
+    hbtrie_result insert_vlen(void *rawkey,
+                              size_t rawkeylen,
+                              void *value,
+                              size_t value_len,
+                              void *oldvalue_out,
+                              size_t *oldvalue_len_out);
     hbtrie_result insertPartial(void *rawkey, int rawkeylen,
                                 void *value, void *oldvalue_out);
 
@@ -516,6 +591,8 @@ public:
 private:
     // HB+trie internal value size (9 bytes)
     static const size_t HV_SIZE;
+    // Max size of the buffer for HB+trie internal value (256 bytes)
+    static const size_t HV_BUF_MAX_SIZE;
 
     // Memory Pool
     static MemoryPool* hbtrieMP;
@@ -623,11 +700,15 @@ private:
      * Estimate B+tree meta data size for given value and prefix length.
      *
      * @param value Value that will be stored in the meta section of B+tree.
-     * @param prefixlen Length of prefix that will be stored in the meta
+     * @param value_len Length of value that will be stored in the meta
+     *        section of B+tree.
+     * @param prefix_len Length of prefix that will be stored in the meta
      *        section of B+tree.
      * @return Size of meta data.
      */
-    metasize_t estMetaSize(void *value, uint16_t prefixlen);
+    metasize_t estMetaSize(void *value,
+                           uint8_t value_len,
+                           uint16_t prefix_len);
 
     /**
      * Store HB+trie meta data in a raw buffer.
@@ -638,6 +719,7 @@ private:
      * @param prefix Skipped common prefix.
      * @param prefixlen Length of skipped common prefix.
      * @param value Value for the key which exactly matches common prefix.
+     * @param value_length Length of value.
      * @return void.
      */
     void storeMeta(metasize_t& metasize_out,
@@ -646,6 +728,7 @@ private:
                    void *prefix,
                    int prefixlen,
                    void *value,
+                   uint8_t value_length,
                    void *buf);
 
     /**
@@ -698,6 +781,7 @@ private:
     hbtrie_result _findV2(void *rawkey,
                           size_t rawkeylen,
                           void *given_valuebuf,
+                          size_t *value_len_out,
                           HBTrieV2Args args,
                           HBTrieV2Rets& rets,
                           bool remove_key);
@@ -771,7 +855,8 @@ private:
      * @return HBTRIE_RESULT_SUCCESS on success.
      */
     hbtrie_result _insertV2(void *rawkey, size_t rawkeylen,
-                            void *given_value, void *oldvalue_out,
+                            void *given_value, size_t given_value_len,
+                            void *oldvalue_out, size_t *oldvalue_len_out,
                             HBTrieV2Args args,
                             HBTrieV2Rets& rets,
                             uint8_t flag);
@@ -791,7 +876,8 @@ private:
      * @return HBTRIE_RESULT_SUCCESS on success.
      */
     hbtrie_result _insertV2Case2(void *rawkey, size_t rawkeylen,
-                                 void *given_value, void *oldvalue_out,
+                                 void *given_value, size_t given_value_len,
+                                 void *oldvalue_out, size_t *oldvalue_len_out,
                                  HBTrieInsV2Args& ins_args,
                                  HBTrieV2Rets& rets,
                                  uint8_t flag);
@@ -811,7 +897,8 @@ private:
      * @return HBTRIE_RESULT_SUCCESS on success.
      */
     hbtrie_result _insertV2Case3(void *rawkey, size_t rawkeylen,
-                                 void *given_value, void *oldvalue_out,
+                                 void *given_value, size_t given_value_len,
+                                 void *oldvalue_out, size_t *oldvalue_len_out,
                                  HBTrieInsV2Args& ins_args,
                                  HBTrieV2Rets& rets,
                                  uint8_t flag);
