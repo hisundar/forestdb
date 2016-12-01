@@ -381,6 +381,7 @@ fdb_status BnodeCacheMgr::flush(FileMgr* file) {
         // Note that this function is invoked as part of a commit operation
         // while the filemgr's lock is already grabbed by a committer.
         // Therefore, we don't need to grab all the shard locks at once.
+        //printf("usage %ld\n", bnodeCacheCurrentUsage.load());
         return flushDirtyIndexNodes(fcache, true, true);
     }
     return FDB_RESULT_FILE_NOT_OPEN;
@@ -636,6 +637,14 @@ bool BnodeCacheMgr::freeFileBnodeCache(FileBnodeCache* fcache, bool force) {
 
 static const size_t BNODE_BUFFER_HEADROOM = 256;
 
+INLINE uint64_t getNearestPowerOf2(uint64_t req_len) {
+    uint64_t ret = 1;
+    while (ret < req_len) {
+        ret *= 2;
+    }
+    return ret;
+}
+
 fdb_status BnodeCacheMgr::fetchFromFile(FileMgr* file,
                                         Bnode** node,
                                         cs_off_t offset) {
@@ -659,7 +668,8 @@ fdb_status BnodeCacheMgr::fetchFromFile(FileMgr* file,
     // 2> Alloc Buffer
     // Note: we allocate a little bit more memory to avoid to call
     //       realloc() if a few new entries are inserted.
-    void *buf = malloc(length + BNODE_BUFFER_HEADROOM);
+    uint64_t buf_length = getNearestPowerOf2(length);
+    void *buf = malloc(buf_length);
 
     // 3> Read: If the node is written over multiple blocks, read
     //    them accoding to the block meta.
@@ -727,7 +737,7 @@ fdb_status BnodeCacheMgr::fetchFromFile(FileMgr* file,
         }
     }
 
-    bnode_out->importRaw(buf, length + BNODE_BUFFER_HEADROOM);
+    bnode_out->importRaw(buf, buf_length);
     bnode_out->setCurOffset(offset);
     // 'buf' to be freed by client
     *node = bnode_out;

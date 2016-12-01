@@ -691,8 +691,9 @@ INLINE int BsaCmp(BsaItem& aa, BsaItem& bb, void *aux)
 BsArray::BsArray() :
     aux(nullptr), kvDataSize(0), arrayBaseOffset(0)
 {
-    arrayCapacity = 32; // minimum blob size for malloc
+    arrayCapacity = 128;
     dataArray = malloc(arrayCapacity);
+    kvMeta.reserve(32);
 }
 
 BsArray::~BsArray() {
@@ -1197,7 +1198,10 @@ BsaItem BsArray::addToArray(BsaItem item, uint32_t idx, bool overwrite) {
 
 void BsArray::adjustArrayCapacity(int gap) {
     if (arrayBaseOffset + kvDataSize + gap > arrayCapacity) {
-        arrayCapacity = arrayBaseOffset + kvDataSize + gap;
+        do {
+            // double the capacity
+            arrayCapacity *= 2;
+        } while (arrayBaseOffset + kvDataSize + gap > arrayCapacity);
         dataArray = realloc(dataArray, arrayCapacity);
     }
 }

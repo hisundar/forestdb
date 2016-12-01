@@ -41,6 +41,7 @@ void StaleDataManager::addInmemStaleInfo(filemgr_header_revnum_t revnum,
                                      uint64_t doc_offset,
                                      bool system_doc_only)
 {
+    return;
     int ret;
     size_t buflen = 0;
     StaleInfoCommit *item;
@@ -127,6 +128,7 @@ void StaleDataManager::loadInmemStaleInfo(FdbKvsHandle *handle)
         // stale info is already loaded (fast screening without mutex)
         return;
     }
+    return;
 
     // first open of the DB file
     // should grab mutex to avoid race with other writer
