@@ -350,19 +350,20 @@ void indexer_pattern_test()
     char temp[32];
 
     // SETUP Configurations...
-    NUM_DOCS = 10000;
+    NUM_DOCS = 100000;
     NUM_WRITER_ITERATIONS = 3;
     COMMIT_FREQ = NUM_DOCS/10;
     SNAPSHOT_FREQ = COMMIT_FREQ / 17; // Derive snapshot freq from commit freq
     ITERATOR_BATCH_SIZE = 10;
-    NUM_ITERATORS = 7;
+    NUM_ITERATORS = 0;
     MAX_NUM_SNAPSHOTS = 5;
     NUM_WRITERS = 1; // Do not bump this up not safe
 
     fconfig.buffercache_size = 8*1024*1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.purging_interval = 0;
-    fconfig.wal_threshold = 40960;
+    fconfig.wal_threshold = 4096;
+    fconfig.wal_flush_before_commit = false;
     fconfig.num_compactor_threads = 1;
     //fconfig.block_reusing_threshold = 0;
     //fconfig.num_wal_partitions = 3;
