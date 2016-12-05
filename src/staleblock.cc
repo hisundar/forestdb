@@ -332,8 +332,12 @@ void StaleDataManager::gatherRegions(FdbKvsHandle *handle,
                 // 'mergetree', that will be created below.
 
                 // do not remove the item
+
+                // === disable above optimization ===
                 cur++;
+                free(item);
             }
+            mergeTree.clear();
         } else {
             // gater from stale_list
             if ( e_last != staleList.end() ) {
