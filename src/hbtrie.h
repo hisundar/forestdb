@@ -786,7 +786,8 @@ private:
                           size_t *value_len_out,
                           HBTrieV2Args args,
                           HBTrieV2Rets& rets,
-                          bool remove_key);
+                          bool remove_key,
+                          int level);
 
     hbtrie_result _remove(void *rawkey, int rawkeylen, uint8_t flag);
 
@@ -861,7 +862,7 @@ private:
                             void *oldvalue_out, size_t *oldvalue_len_out,
                             HBTrieV2Args args,
                             HBTrieV2Rets& rets,
-                            uint8_t flag);
+                            uint8_t flag, int level);
 
     /**
      * Internal insertion function for the case 2 described in _insertV2().

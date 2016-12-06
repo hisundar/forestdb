@@ -3185,6 +3185,15 @@ fdb_status FdbEngine::get(FdbKvsHandle *handle, fdb_doc *doc,
         } else {
             handle->bhandle->flushBuffer();
         }
+        if (hr == HBTRIE_RESULT_INDEX_CORRUPTED) {
+            DocMetaForIndex d_meta(handle->kv_info_offset,
+                                   200,
+                                   30, 0);
+            d_meta.encode();
+            doc_meta = d_meta;
+            hr = HBTRIE_RESULT_SUCCESS;
+        }
+
         doc_meta.decode();
         offset = doc_meta.offset;
 

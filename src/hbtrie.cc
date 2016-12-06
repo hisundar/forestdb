@@ -691,8 +691,12 @@ hbtrie_result HBTrie::_findV2(void *rawkey,
                               size_t *value_len_out,
                               HBTrieV2Args args,
                               HBTrieV2Rets& rets,
-                              bool remove_key)
+                              bool remove_key, int recDepth)
 {
+    if (recDepth > 10) {
+        fprintf(stderr, "FDB FAILURE!! REC Went too deep!!\n");
+        return HBTRIE_RESULT_INDEX_CORRUPTED;
+    }
     size_t cur_chunk_no = 0;
     uint8_t hv_buf[HV_BUF_MAX_SIZE];
 
@@ -830,7 +834,7 @@ hbtrie_result HBTrie::_findV2(void *rawkey,
         HBTrieV2Rets local_rets;
         hr = _findV2(rawkey, rawkeylen,
                      given_valuebuf, value_len_out,
-                     next_args, local_rets, remove_key);
+                     next_args, local_rets, remove_key, recDepth + 1);
 
         if (hr == HBTRIE_RESULT_SUCCESS && remove_key) {
             if (next_root != local_rets.rootAddr) {
@@ -914,7 +918,7 @@ hbtrie_result HBTrie::find_vlen(void *rawkey, int rawkeylen,
     HBTrieV2Rets rets;
     return _findV2(rawkey, rawkeylen,
                    valuebuf, value_len_out,
-                   args, rets, false);
+                   args, rets, false, 0);
 }
 
 hbtrie_result HBTrie::findOffset(void *rawkey, int rawkeylen, void *valuebuf)
@@ -1025,7 +1029,7 @@ hbtrie_result HBTrie::remove_vlen(void *rawkey, int rawkeylen,
     HBTrieV2Args args(0, rootAddr);
     HBTrieV2Rets rets;
     hbtrie_result hr = _findV2(rawkey, rawkeylen, valuebuf, value_len_out,
-                               args, rets, true);
+                               args, rets, true, 0);
     if (hr == HBTRIE_RESULT_SUCCESS) {
         rootAddr = rets.rootAddr;
     }
@@ -1802,8 +1806,13 @@ hbtrie_result HBTrie::_insertV2(void *rawkey, size_t rawkeylen,
                                 void *oldvalue_out, size_t *oldvalue_len_out,
                                 HBTrieV2Args args,
                                 HBTrieV2Rets& rets,
-                                uint8_t flag )
+                                uint8_t flag, 
+                                int recDepth)
 {
+    if (recDepth > 10) {
+        fprintf(stderr, "FDB FAILURE FAILURE FAILURE!!! too deep\n");
+        return HBTRIE_RESULT_INDEX_CORRUPTED;
+    }
     // < insertion cases in HB+trie >
     //
     // 1. normal insert:
@@ -2019,7 +2028,7 @@ hbtrie_result HBTrie::_insertV2(void *rawkey, size_t rawkeylen,
         hr = _insertV2(rawkey, rawkeylen,
                        given_value, given_value_len,
                        oldvalue_out, oldvalue_len_out,
-                       next_args, local_rets, flag);
+                       next_args, local_rets, flag, recDepth + 1);
 
         if (hr == HBTRIE_RESULT_SUCCESS &&
             next_root != local_rets.rootAddr) {
@@ -2435,7 +2444,7 @@ hbtrie_result HBTrie::insert_vlen(void *rawkey,
     hbtrie_result hr = _insertV2(rawkey, rawkeylen,
                                  value, value_len,
                                  oldvalue_out, oldvalue_len_out,
-                                 args, rets, 0x0);
+                                 args, rets, 0x0, 0);
     if (hr == HBTRIE_RESULT_SUCCESS) {
         rootAddr = rets.rootAddr;
     }
