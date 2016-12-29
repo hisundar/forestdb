@@ -5693,7 +5693,13 @@ fdb_status WalFlushCallbacks::flushItem(void *dbhandle,
                 handle->seqtrie->insert(kvid_seqnum, size_id + size_seq,
                                         (void *)&_offset, (void *)&old_offset_local);
             } else {
-                handle->seqtree->insert((void *)&_seqnum, (void *)&_offset);
+                if (btreev2) {
+                    BtreeKvPair kv((void *)&_seqnum, sizeof(uint64_t),
+                            (void *)&_offset, sizeof(uint64_t));
+                    handle->seqtreeV2->insert(kv);
+                } else {
+                    handle->seqtree->insert((void *)&_seqnum, (void *)&_offset);
+                }
             }
 
             if (btreev2) {

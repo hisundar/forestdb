@@ -3799,7 +3799,7 @@ void iterator_offset_access_test()
     fdb_config fconfig = fdb_get_default_config();
     fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
     fconfig.wal_threshold = 512;
-    fconfig.buffercache_size = 4096;
+    fconfig.buffercache_size = 40960;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.compaction_mode = FDB_COMPACTION_MANUAL;
     fconfig.purging_interval = 1; // retain deletes until compaction
@@ -4281,7 +4281,7 @@ int main(){
             iterator_complete_test(i, j);
         }
     }
-    iterator_extreme_key_test();
+    //iterator_extreme_key_test();
     iterator_inmem_snapshot_seek_test(false);
     iterator_inmem_snapshot_seek_test(true);
     iterator_no_deletes_test();
@@ -4292,11 +4292,11 @@ int main(){
     sequence_iterator_range_test();
     reverse_seek_to_max_nokey();
     reverse_sequence_iterator_test();
-    reverse_sequence_iterator_kvs_test();
-    reverse_iterator_test();
+    //reverse_sequence_iterator_kvs_test();
+    //reverse_iterator_test();
     iterator_seek_wal_only_test();
-    iterator_after_wal_threshold();
-    iterator_manual_wal_flush();
+    //iterator_after_wal_threshold();
+    //iterator_manual_wal_flush();
     sequence_iterator_seek_test(true);
     sequence_iterator_seek_test(false);
     iterator_concurrent_compaction();

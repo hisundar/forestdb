@@ -57,6 +57,7 @@ int NUM_DOCS;
 int COMMIT_FREQ;
 int SNAPSHOT_FREQ;
 int NUM_ITERATORS;
+int NUM_FILES;
 int NUM_WRITERS;
 int NUM_WRITER_ITERATIONS;
 int ITERATOR_BATCH_SIZE;
@@ -127,6 +128,12 @@ INLINE void make_key(char *buf, int i, int8_t key_ver) {
     sprintf(buf, "%08d %d", i, key_ver);
 }
 
+#include "internal_types.h"
+#include "file_handle.h"
+#include "kvs_handle.h"
+#include "filemgr.h"
+#include "wal.h"
+
 fdb_status indexer_set(storage_t *st, int docid, int mutno, bool isdel)
 {
     TEST_INIT();
@@ -175,12 +182,16 @@ fdb_status indexer_set(storage_t *st, int docid, int mutno, bool isdel)
         TEST_CHK(s == FDB_RESULT_SUCCESS);
     }
 
-    if (mutno && (mutno % COMMIT_FREQ) == 0) {
+    bool snok = false;
+    if ((mutno && (mutno % COMMIT_FREQ) == 0)) {
         s = fdb_commit(st->fhandle, FDB_COMMIT_NORMAL);
         TEST_CHK(s == FDB_RESULT_SUCCESS);
+        if (st->main->file->getWal()->getDirtyStatus_Wal() != FDB_WAL_DIRTY) {
+            snok = true;
+        }
     }
 
-    if (mutno && (mutno % SNAPSHOT_FREQ) == 0) {
+    if (mutno && (mutno % SNAPSHOT_FREQ) == 0 && snok) {
         fdb_kvs_handle *new_snapshot, *old_snapshot;
         s = fdb_snapshot_open(st->main, &new_snapshot, FDB_SNAPSHOT_INMEM);
         TEST_CHK(s == FDB_RESULT_SUCCESS);
@@ -309,15 +320,25 @@ static void *_iterator_thread(void *voidargs)
         make_key(buf, start_key, 0);
         s = fdb_iterator_init(snapdb, &it, buf, strlen(buf) + 1, NULL, 0,
                               FDB_ITR_NO_DELETES);
-        for (int i = start_key; i < end_key; ++i) {
+        int isFailure = 0, i;
+        for (i = start_key; i < end_key; ++i) {
             if (key_snap[i] > 0) { // if the key was non-deleted in snapshot
+                if (s != FDB_RESULT_SUCCESS) {
+                    isFailure = 3;
+                    break;
+                }
                 TEST_CHK(s == FDB_RESULT_SUCCESS); //next should be SUCCESS
                 s = fdb_iterator_get(it, &rdoc);
                 if (s == FDB_RESULT_ITERATOR_FAIL) {
+                    isFailure = 1;
                     break; // break!
                 }
                 TEST_CHK(s == FDB_RESULT_SUCCESS);
                 make_key(buf, i, key_snap[i]);
+                if (memcmp(rdoc->key, buf, rdoc->keylen)) {
+                    isFailure = 2;
+                    break;
+                }
                 TEST_CMP(rdoc->key, buf, rdoc->keylen); // validate it
                 fdb_doc_free(rdoc);
                 rdoc = NULL;
@@ -326,6 +347,20 @@ static void *_iterator_thread(void *voidargs)
             } else { // this key is not expected to be returned..
                 continue;
             }
+        }
+        if (isFailure) {
+            printf("Failed to Iterate start_key =%d, i = %d, end_key = %d %s != %s\n",
+                   start_key, i, end_key, buf, rdoc ? rdoc->key : "STOPPED!!");
+
+            s = fdb_iterator_close(it);
+            make_key(buf, start_key, 0);
+            s = fdb_iterator_init(snapdb, &it, buf, strlen(buf) + 1, NULL, 0,
+                                  FDB_ITR_NO_DELETES);
+            for (int j = start_key; j < i - 1; j++) {
+                s = fdb_iterator_next(it);
+                TEST_CHK(s == FDB_RESULT_SUCCESS);
+            }
+            TEST_CHK(false);
         }
         s = fdb_iterator_close(it);
         TEST_CHK(s == FDB_RESULT_SUCCESS);
@@ -350,20 +385,21 @@ void indexer_pattern_test()
     char temp[32];
 
     // SETUP Configurations...
-    NUM_DOCS = 10000;
+    NUM_DOCS = 100000;
     NUM_WRITER_ITERATIONS = 3;
-    COMMIT_FREQ = NUM_DOCS/10;
-    SNAPSHOT_FREQ = COMMIT_FREQ / 17; // Derive snapshot freq from commit freq
+    COMMIT_FREQ = NUM_DOCS/100 / 17;
+    SNAPSHOT_FREQ = COMMIT_FREQ; // Derive snapshot freq from commit freq
     ITERATOR_BATCH_SIZE = 10;
-    NUM_ITERATORS = 7;
+    NUM_ITERATORS = 4;
     MAX_NUM_SNAPSHOTS = 5;
     NUM_WRITERS = 1; // Do not bump this up not safe
 
     fconfig.buffercache_size = 8*1024*1024;
     fconfig.flags = FDB_OPEN_FLAG_CREATE;
     fconfig.purging_interval = 0;
-    fconfig.wal_threshold = 40960;
+    fconfig.wal_threshold = 4096;
     fconfig.num_compactor_threads = 1;
+    fconfig.wal_flush_before_commit = false;
     //fconfig.block_reusing_threshold = 0;
     //fconfig.num_wal_partitions = 3;
 
@@ -429,6 +465,10 @@ void indexer_pattern_test()
         thread_join(tid[i], &thread_ret[i]);
     }
 
+    printf("Done with iterations.. Compacting...\n");
+    s = fdb_compact(db.fhandle, nullptr);
+    TEST_CHK(s == FDB_RESULT_SUCCESS);
+
     printf("Done with iterations.. Stats..\n");
     // also get latency stats..
     for (int i = 0; i < FDB_LATENCY_NUM_STATS; ++i) {
@@ -458,8 +498,170 @@ void indexer_pattern_test()
     TEST_RESULT(temp);
 }
 
+typedef struct storage_wrapper_t {
+    int writer_id;
+    storage_t *db;
+}storage_wrapper_t;
+
+static void *_epe_writer_thread(void *voidargs)
+{
+    TEST_INIT();
+    storage_wrapper_t *args = (storage_wrapper_t *)voidargs;
+    storage_t *db = (storage_t *)args->db;
+    int writer_id = args->writer_id;
+    fdb_status s;
+
+    fdb_doc *rdoc;
+    char keybuf[32];
+    char bodybuf[32];
+    fdb_doc_create(&rdoc, NULL, 0, NULL,0, NULL,0);
+    rdoc->key = &keybuf;
+    rdoc->keylen = 19;
+    sprintf(bodybuf, "SameBody");
+    rdoc->body = &bodybuf;
+    rdoc->bodylen = 8;
+
+    int batch_size = 1024;
+    int doc_idx = NUM_DOCS * NUM_FILES;
+    for (int fidx = writer_id; doc_idx >= 0;
+         fidx = (fidx + NUM_WRITERS) % NUM_FILES) {
+        for (int batch_end = doc_idx - batch_size;
+             doc_idx >= batch_end; doc_idx--) {
+            sprintf(keybuf, "38d7cd-000%9d", doc_idx);
+            s = fdb_set(db[fidx].main, rdoc);
+            TEST_CHK(s == FDB_RESULT_SUCCESS);
+        }
+        sprintf(keybuf, "vb_%d", fidx);
+        s = fdb_set_kv(db[fidx].def, keybuf, strlen(keybuf)+1,
+                       (void *)"vbstate", 8);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        s = fdb_commit(db[fidx].fhandle, FDB_COMMIT_NORMAL);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        batch_size += batch_size / 10; // Batch size keeps increasing by 10%
+    }
+
+    printf("--------LOADING COMPLETE------\n");
+    rdoc->key = NULL;
+    rdoc->body = NULL;
+    fdb_doc_free(rdoc);
+
+    thread_exit(0);
+    return NULL;
+}
+void epengine_pattern_test()
+{
+    TEST_INIT();
+
+    memleak_start();
+    int r;
+    fdb_status s;
+    fdb_config fconfig = fdb_get_default_config();
+    fdb_kvs_config kvs_config = fdb_get_default_kvs_config();
+    char temp[32];
+
+    // SETUP Configurations...
+    NUM_DOCS = 100000; // number of docs per file
+    NUM_WRITERS = 4;
+    NUM_FILES = NUM_WRITERS * 6;
+    NUM_WRITER_ITERATIONS = 0;
+    COMMIT_FREQ = NUM_DOCS/10;
+    SNAPSHOT_FREQ = COMMIT_FREQ / 17; // Derive snapshot freq from commit freq
+    ITERATOR_BATCH_SIZE = 10;
+    NUM_ITERATORS = 0;
+    MAX_NUM_SNAPSHOTS = 5;
+
+    //fconfig.buffercache_size = 8*1024*1024;
+    //fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    fconfig.wal_flush_before_commit = false;
+    fconfig.purging_interval = 0;
+    fconfig.wal_threshold = 4096;
+    fconfig.num_compactor_threads = 1;
+    fconfig.block_reusing_threshold = 100;
+    //fconfig.num_wal_partitions = 3;
+
+    thread_t *wtid = alca(thread_t, NUM_WRITERS);
+    void **thread_ret = alca(void *, NUM_WRITERS);
+
+    // Get the default callbacks which result in normal operation for other ops
+    struct anomalous_callbacks *disk_sim_cb = get_default_anon_cbs();
+    storage_t *db = (storage_t *) calloc(NUM_FILES, sizeof(storage_t));
+
+    // Modify the pwrite callback to redirect to test-specific function
+    disk_sim_cb->pwrite_cb = &pwrite_cb;
+    disk_sim_cb->pread_cb = &pread_cb;
+    disk_sim_cb->close_cb = &close_cb;
+    disk_sim_cb->fsync_cb = &fsync_cb;
+
+    // remove previous anomaly_test files
+    r = system(SHELL_DEL " " TEST_FILENAME "* > errorlog.txt");
+    (void)r;
+
+    for (int i = 0; i < NUM_FILES; ++i) {
+        // Reset anomalous behavior stats..
+        filemgr_ops_anomalous_init(disk_sim_cb, &db[i]);
+
+        db[i].fconfig = fconfig;
+        db[i].kvs_config = kvs_config;
+        db[i].fflag = (uint8_t)(-1);
+        char fname[32];
+        sprintf(fname, "%s_%d", TEST_FILENAME, i);
+        s = fdb_open(&db[i].fhandle, fname, &db[i].fconfig);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        s = fdb_kvs_open_default(db[i].fhandle, &db[i].def, &db[i].kvs_config);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        s = fdb_kvs_open(db[i].fhandle, &db[i].main, "main", &db[i].kvs_config);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+    }
+
+    printf("Num docs %d Num writers %d Commit freq %d Snapshot freq %d "
+           "Iterator batch %d Num iterator threads %d\n",
+           NUM_DOCS, NUM_WRITER_ITERATIONS, COMMIT_FREQ, SNAPSHOT_FREQ,
+           ITERATOR_BATCH_SIZE, NUM_ITERATORS);
+    printf("Wal size %" _F64 " Buffercache size %" _F64 "MB\n",
+           fconfig.wal_threshold, fconfig.buffercache_size/1024/1024);
+    storage_wrapper_t *wargs = (storage_wrapper_t *)malloc(NUM_WRITERS
+                               * sizeof(storage_wrapper_t));
+    for (r = 0; r < NUM_WRITERS; ++r) {
+        wargs[r].writer_id = r;
+        wargs[r].db = db;
+        thread_create(&wtid[r], _epe_writer_thread, &wargs[r]);
+    }
+
+    usleep(1);
+
+    for (int i = 0; i < NUM_WRITERS; ++i) {
+        thread_join(wtid[i], &thread_ret[i]);
+    }
+
+    printf("Done with writers.. Stats..\n");
+    for (int i = 0; i < NUM_FILES; ++i) {
+        spin_destroy(&db[i].lock);
+        fdb_close(db[i].fhandle);
+    }
+    free(db);
+    free(wargs);
+    // also get latency stats..
+    for (int i = 0; i < FDB_LATENCY_NUM_STATS; ++i) {
+        fdb_latency_stat stat;
+        memset(&stat, 0, sizeof(fdb_latency_stat));
+        s = fdb_get_latency_stats(db[0].fhandle, &stat, i);
+        TEST_CHK(s == FDB_RESULT_SUCCESS);
+        fprintf(stderr, "%s:\t%u\t%u\t%u\t%" _F64 "\n",
+                fdb_latency_stat_name(i),
+                stat.lat_min, stat.lat_avg, stat.lat_max, stat.lat_count);
+    }
+
+    fdb_shutdown();
+
+    memleak_end();
+
+    sprintf(temp, "indexer pattern test:");
+
+    TEST_RESULT(temp);
+}
 int main(){
     indexer_pattern_test();
+ //   epengine_pattern_test();
 
     return 0;
 }

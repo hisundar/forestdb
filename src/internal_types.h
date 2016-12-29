@@ -59,7 +59,7 @@ class WalItr;
 #define FILEMGR_MAGIC_000 (UINT64_C(0xdeadcafebeefbeef))
 
 // TODO: Set to 003 once BtreeV2 is ready
-#define FILEMGR_LATEST_MAGIC FILEMGR_MAGIC_002
+#define FILEMGR_LATEST_MAGIC FILEMGR_MAGIC_003
 
 
 /**

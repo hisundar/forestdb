@@ -246,17 +246,25 @@ fdb_status Compaction::compactFile(FdbFileHandle *fhandle,
         sb->returnReusableBlocks(handle);
     }
 
-    // (5) The new header should be appended at the end of the current file
-    handle->last_hdr_bid = handle->file->getNextAllocBlock();
-    handle->last_wal_flush_hdr_bid = handle->last_hdr_bid;
-    handle->cur_header_revnum = fdb_set_file_header(handle);
-
     if (ver_btreev2_format(handle->file->getVersion())) {
-        // (6) Release the reference counts on all Btree nodes of old file so
+        // (5) Release the reference counts on all Btree nodes of old file so
         // that they may be evicted in case of memory pressure.
+        // write/flush all index nodes at once
+        handle->trie->writeDirtyNodes();
+        if (handle->config.seqtree_opt == FDB_SEQTREE_USE) {
+            if (handle->config.multi_kv_instances) {
+                handle->seqtrie->writeDirtyNodes();
+            } else {
+                handle->seqtreeV2->writeDirtyNodes();
+            }
+        }
+        handle->staletreeV2->writeDirtyNodes();
+        handle->bnodeMgr->moveDirtyNodesToBcache();
+        BnodeCacheMgr::get()->flush(handle->file);
+        handle->bnodeMgr->markEndOfIndexBlocks();
         handle->bnodeMgr->releaseCleanNodes();
     } else {
-        // (6) Flush all the dirty blocks of the current file
+        // (5) Flush all the dirty blocks of the current file
         handle->bhandle->flushBuffer();
     }
     if (ver_btreev2_format(compaction.fileMgr->getVersion())) {
@@ -271,6 +279,11 @@ fdb_status Compaction::compactFile(FdbFileHandle *fhandle,
         compaction.btreeHandle->flushBuffer();
     }
 
+    // (6) The new header should be appended at the end of the current file
+    handle->last_hdr_bid = handle->file->getNextAllocBlock();
+    handle->last_wal_flush_hdr_bid = handle->last_hdr_bid;
+    handle->cur_header_revnum = fdb_set_file_header(handle);
+
     // (7) Commit the current file
     fdb_status fs = handle->file->commit_FileMgr(
                     !(handle->config.durability_opt & FDB_DRB_ASYNC),
@@ -284,7 +297,7 @@ fdb_status Compaction::compactFile(FdbFileHandle *fhandle,
         return fs;
     }
 
-    if (ver_btreev2_format(handle->file->getVersion())) {
+    if (!ver_btreev2_format(handle->file->getVersion())) {
         // (8) Reset the sub-block and update the superblock in the current file
         handle->bhandle->resetSubblockInfo();
     }
@@ -431,6 +444,19 @@ fdb_status Compaction::compactFile(FdbFileHandle *fhandle,
                                       WalFlushCallbacks::updateKvsDeltaStats,
                                       &flush_items);
     if (ver_btreev2_format(handle->file->getVersion())) {
+        // write/flush all index nodes at once
+        handle->trie->writeDirtyNodes();
+        if (handle->config.seqtree_opt == FDB_SEQTREE_USE) {
+            if (handle->config.multi_kv_instances) {
+                handle->seqtrie->writeDirtyNodes();
+            } else {
+                handle->seqtreeV2->writeDirtyNodes();
+            }
+        }
+        handle->staletreeV2->writeDirtyNodes();
+        handle->bnodeMgr->moveDirtyNodesToBcache();
+        BnodeCacheMgr::get()->flush(handle->file);
+        handle->bnodeMgr->markEndOfIndexBlocks();
         handle->bnodeMgr->releaseCleanNodes();
     } else {
         handle->bhandle->flushBuffer();
@@ -2696,6 +2722,22 @@ fdb_status Compaction::commitAndRemovePending(FdbKvsHandle *handle,
                                             handle->kv_info_offset,
                                             new_file->getSeqnum(),
                                             false);
+    if (ver_btreev2_format(new_file->getVersion())) {
+        // write/flush all index nodes at once
+        handle->trie->writeDirtyNodes();
+        if (handle->config.seqtree_opt == FDB_SEQTREE_USE) {
+            if (handle->config.multi_kv_instances) {
+                handle->seqtrie->writeDirtyNodes();
+            } else {
+                handle->seqtreeV2->writeDirtyNodes();
+            }
+        }
+        handle->staletreeV2->writeDirtyNodes();
+        handle->bnodeMgr->moveDirtyNodesToBcache();
+        BnodeCacheMgr::get()->flush(handle->file);
+        handle->bnodeMgr->markEndOfIndexBlocks();
+    }
+
     handle->last_hdr_bid = new_file->getNextAllocBlock();
     if (new_file->getWal()->getDirtyStatus_Wal() == FDB_WAL_CLEAN) {
         earliest_txn = new_file->getWal()->getEarliestTxn_Wal(new_file->getGlobalTxn());
